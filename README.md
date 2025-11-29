@@ -31,19 +31,10 @@
 ### 一键运行
 
 ```bash
-# 方式一：wget
-wget  https://raw.githubusercontent.com/xx2468171796/bbr3/main/bbr.sh
-chmod +x bbr.sh
-./bbr.sh
-
-# 方式二：curl
-curl -fsSL https://raw.githubusercontent.com/xx2468171796/bbr3/main/bbr.sh | sudo bash
+wget  https://github.com/xx2468171796/EasyBBR3/blob/main/easybbr3.sh
+chmod +x easybbr3.sh
+./easybbr3.sh
 ```
-
-wget https://raw.githubusercontent.com/xx2468171796/pvetools/main/pvetools.sh
-chmod +x pvetools.sh
-./pvetools.sh
-
 
 ### 下载后运行
 
