@@ -29,7 +29,7 @@
 ## 🚀 快速开始
 
 ### 一键运行
-
+### 先 apt update 更新一下系统 软件源 再 运行软件安装新内核，可能会提示下载失败，这个时候再一次apt update 再次运行就可以了，有些时候不需要这样看你的系统里面有没有 源
 ```bash
 wget  https://raw.githubusercontent.com/xx2468171796/EasyBBR3/main/easybbr3.sh
 chmod +x easybbr3.sh
