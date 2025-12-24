@@ -61,7 +61,7 @@ curl -fsSL https://raw.githubusercontent.com/xx2468171796/EasyBBR3/main/easybbr3
 ```bash
 wget https://raw.githubusercontent.com/xx2468171796/EasyBBR3/main/easybbr3.sh
 chmod +x easybbr3.sh
-sudo ./easybbr3.sh
+./easybbr3.sh
 ```
 
 ### 安装快捷命令
