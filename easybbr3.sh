@@ -2014,8 +2014,9 @@ detect_full_hardware() {
     # 磁盘评分 (0-100)
     local disk_type="hdd"
     if [[ -d /sys/block ]]; then
-        for disk in /sys/block/sd* /sys/block/vd* /sys/block/nvme* 2>/dev/null; do
-            [[ -d "$disk" ]] || continue
+        local disk
+        for disk in /sys/block/sd* /sys/block/vd* /sys/block/nvme*; do
+            [[ -e "$disk" ]] || continue
             local rotational
             rotational=$(cat "${disk}/queue/rotational" 2>/dev/null || echo 1)
             if [[ "$rotational" == "0" ]]; then
@@ -2061,6 +2062,9 @@ show_hardware_report() {
     detect_full_hardware
     is_low_spec_vps
     
+    # 确保系统信息已检测
+    [[ -z "${DIST_ID:-}" ]] && detect_os
+    
     echo
     echo -e "  ${BOLD}硬件检测结果${NC}"
     print_separator
@@ -2068,7 +2072,7 @@ show_hardware_report() {
     printf "    %-15s : %s 核\n" "CPU" "$PROXY_CPU_CORES"
     printf "    %-15s : %s MB\n" "内存" "$PROXY_MEM_MB"
     printf "    %-15s : %s\n" "磁盘类型" "$PROXY_DISK_TYPE"
-    printf "    %-15s : %s\n" "系统" "$DIST_ID $DIST_VERSION"
+    printf "    %-15s : %s\n" "系统" "${DIST_ID:-unknown} ${DIST_VER:-unknown}"
     printf "    %-15s : %s\n" "内核" "$(uname -r)"
     printf "    %-15s : %s\n" "虚拟化" "${VIRT_TYPE:-未知}"
     echo
@@ -2085,11 +2089,22 @@ show_hardware_report() {
 check_current_kernel() {
     local kernel_version
     kernel_version=$(uname -r)
+    local kver_short
+    kver_short=$(echo "$kernel_version" | sed 's/[^0-9.].*$//')
     
     local has_bbr3=false
+    local is_mainline_bbr3=false
+    
     if [[ -f /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
+        # 检查是否有 bbr3 算法
         if grep -q "bbr3" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
             has_bbr3=true
+        # 检查主线内核 >= 6.9 的 BBR3 (以 bbr 名称提供)
+        elif grep -q "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            if version_ge "$kver_short" "6.9.0"; then
+                has_bbr3=true
+                is_mainline_bbr3=true
+            fi
         fi
     fi
     
@@ -2100,7 +2115,11 @@ check_current_kernel() {
     printf "    %-15s : %s\n" "当前内核" "$kernel_version"
     
     if [[ "$has_bbr3" == "true" ]]; then
-        printf "    %-15s : ${GREEN}✅ 已支持${NC}\n" "BBR3 支持"
+        if [[ "$is_mainline_bbr3" == "true" ]]; then
+            printf "    %-15s : ${GREEN}✅ 已支持 (内核内置)${NC}\n" "BBR3 支持"
+        else
+            printf "    %-15s : ${GREEN}✅ 已支持${NC}\n" "BBR3 支持"
+        fi
     else
         printf "    %-15s : ${YELLOW}❌ 需要安装新内核${NC}\n" "BBR3 支持"
     fi
@@ -2210,20 +2229,40 @@ detect_line_type() {
     echo
     print_info "正在自动检测线路类型..."
     
-    # 尝试 traceroute 检测 AS 号
     local as_num=""
-    if command -v traceroute &>/dev/null; then
+    
+    # 方法1: 使用 ipinfo.io API 获取 AS 信息 (更可靠)
+    if [[ -z "$as_num" ]]; then
+        local org_info=""
+        org_info=$(curl -s --max-time 5 ipinfo.io/org 2>/dev/null || true)
+        if [[ -n "$org_info" ]]; then
+            as_num=$(echo "$org_info" | grep -oE 'AS[0-9]+' | head -1 || true)
+        fi
+    fi
+    
+    # 方法2: 尝试 traceroute 检测 AS 号 (备用)
+    if [[ -z "$as_num" ]] && command -v traceroute &>/dev/null; then
         as_num=$(traceroute -A -n -m 5 8.8.8.8 2>/dev/null | grep -oE 'AS[0-9]+' | head -1 || true)
     fi
     
+    # 方法3: 使用 whois 查询本机 IP (备用)
+    if [[ -z "$as_num" ]] && command -v whois &>/dev/null; then
+        local my_ip=""
+        my_ip=$(curl -s --max-time 3 ifconfig.me 2>/dev/null || curl -s --max-time 3 ip.sb 2>/dev/null || true)
+        if [[ -n "$my_ip" ]]; then
+            as_num=$(whois "$my_ip" 2>/dev/null | grep -iE 'origin|OriginAS' | grep -oE 'AS[0-9]+' | head -1 || true)
+        fi
+    fi
+    
     if [[ -n "$as_num" ]]; then
+        log_debug "检测到 AS 号: $as_num"
         case "$as_num" in
-            AS4809)  PROXY_LINE_TYPE="cn2gia"; print_success "检测到 CN2 线路" ;;
-            AS58453) PROXY_LINE_TYPE="cmi"; print_success "检测到 CMI 线路" ;;
-            AS9929)  PROXY_LINE_TYPE="9929"; print_success "检测到 9929 线路" ;;
-            AS4837)  PROXY_LINE_TYPE="4837"; print_success "检测到 4837 线路" ;;
-            AS4134)  PROXY_LINE_TYPE="163"; print_success "检测到 163 线路" ;;
-            *)       PROXY_LINE_TYPE="unknown"; print_warn "未能识别线路类型，使用默认配置" ;;
+            AS4809)  PROXY_LINE_TYPE="cn2gia"; print_success "检测到 CN2 线路 ($as_num)" ;;
+            AS58453) PROXY_LINE_TYPE="cmi"; print_success "检测到 CMI 线路 ($as_num)" ;;
+            AS9929)  PROXY_LINE_TYPE="9929"; print_success "检测到 9929 线路 ($as_num)" ;;
+            AS4837)  PROXY_LINE_TYPE="4837"; print_success "检测到 4837 线路 ($as_num)" ;;
+            AS4134)  PROXY_LINE_TYPE="163"; print_success "检测到 163 线路 ($as_num)" ;;
+            *)       PROXY_LINE_TYPE="unknown"; print_info "AS: $as_num (非中国大陆线路，使用通用配置)" ;;
         esac
     else
         PROXY_LINE_TYPE="unknown"
@@ -2449,7 +2488,18 @@ install_system_services() {
                     systemctl start irqbalance >/dev/null 2>&1
                     print_success "irqbalance 已安装并启动"
                 else
-                    print_info "irqbalance 已存在"
+                    # 服务已安装，检查是否运行
+                    if systemctl is-active irqbalance >/dev/null 2>&1; then
+                        print_info "irqbalance 已在运行"
+                    else
+                        print_step "启动 irqbalance..."
+                        systemctl enable irqbalance >/dev/null 2>&1
+                        if systemctl start irqbalance >/dev/null 2>&1; then
+                            print_success "irqbalance 已启动"
+                        else
+                            print_warn "irqbalance 启动失败"
+                        fi
+                    fi
                 fi
                 ;;
             haveged)
@@ -2464,7 +2514,18 @@ install_system_services() {
                     systemctl start haveged >/dev/null 2>&1
                     print_success "haveged 已安装并启动"
                 else
-                    print_info "haveged 已存在"
+                    # 服务已安装，检查是否运行
+                    if systemctl is-active haveged >/dev/null 2>&1; then
+                        print_info "haveged 已在运行"
+                    else
+                        print_step "启动 haveged..."
+                        systemctl enable haveged >/dev/null 2>&1
+                        if systemctl start haveged >/dev/null 2>&1; then
+                            print_success "haveged 已启动"
+                        else
+                            print_warn "haveged 启动失败"
+                        fi
+                    fi
                 fi
                 ;;
         esac
@@ -3610,7 +3671,6 @@ scene_config_menu() {
         print_header "场景配置"
         
         echo -e "${DIM}根据使用场景选择预设优化方案，参数会根据服务器配置动态调整${NC}"
-        echo -e "${DIM}注意: 此功能与「自动优化配置」互斥，后执行的会覆盖前者${NC}"
         echo
         
         # 获取自动检测的算法和队列
@@ -4416,6 +4476,27 @@ kernel_precheck() {
     
     # 磁盘空间检查
     if ! precheck_disk; then
+        return 1
+    fi
+    
+    # 显示安装提示信息
+    echo
+    print_separator
+    echo -e "  ${YELLOW}${BOLD}📢 安装提示${NC}"
+    print_separator
+    echo
+    echo -e "  ${CYAN}首次安装 BBR3 内核会更新系统软件包及其相关依赖，请耐心等待。${NC}"
+    echo
+    echo -e "  • 如果大于 ${YELLOW}30 分钟${NC}未完成整个安装流程，请调整系统源/更新源后再试"
+    echo -e "  • 根据您机器带宽大小和线路情况，首次安装时间不等"
+    echo -e "  • 正常情况下 ${GREEN}3 分钟左右${NC}安装完毕"
+    echo
+    echo -e "  ${GREEN}感谢您的选择！${NC}"
+    print_separator
+    echo
+    
+    if ! confirm "了解以上信息，继续安装？" "y"; then
+        print_info "已取消安装"
         return 1
     fi
     
@@ -5529,13 +5610,10 @@ show_main_menu() {
         echo -e "${DIM}当前: $(get_current_algo) / $(get_current_qdisc) | 推荐: $(suggest_best_algo)${NC}"
         echo -e "${DIM}推荐场景: $(get_scene_name "$SCENE_RECOMMENDED")${NC}"
         echo
-        echo -e "${YELLOW}提示: 选项 2 和 3 功能相似，选择其一即可，后者会覆盖前者配置${NC}"
-        echo
-        
         print_menu "请选择操作" \
             "安装新内核 (获取BBR3支持)" \
             "场景配置 (按用途优化，推荐VPS代理使用)" \
-            "自动优化配置 (按网络环境自动调参)" \
+            "验证优化状态 (检测优化是否生效)" \
             "查看当前状态" \
             "备份/恢复配置" \
             "卸载配置" \
@@ -5551,7 +5629,7 @@ show_main_menu() {
                 ;;
             1) show_kernel_menu ;;
             2) scene_config_menu ;;
-            3) do_auto_tune ;;
+            3) show_verification_menu ;;
             4) show_status ;;
             5) show_backup_menu ;;
             6) do_uninstall ;;
