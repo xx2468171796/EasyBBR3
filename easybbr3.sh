@@ -3909,16 +3909,32 @@ proxy_tune_wizard() {
     print_step "第一步：检测硬件"
     show_hardware_report
     
-    # 步骤 1.5: 带宽/RTT 检测
-    print_step "检测网络参数（带宽/RTT）..."
-    echo -e "${CYAN}正在检测带宽和延迟...${NC}"
-    detect_bandwidth >/dev/null 2>&1
+    # 步骤 1.5: 带宽/RTT 检测（用户手填优先）
+    print_step "网络参数配置（带宽/RTT）..."
+    echo
+    echo -e "  ${BOLD}请输入您的服务器带宽（留空则自动检测）${NC}"
+    echo -e "  ${DIM}提示: 如果您知道服务器带宽，建议手动输入以获得更准确的优化${NC}"
+    echo
+    local user_bandwidth
+    user_bandwidth=$(read_input "服务器带宽 (Mbps)" "")
+    
+    if [[ -n "$user_bandwidth" ]] && [[ "$user_bandwidth" =~ ^[0-9]+$ ]] && [[ $user_bandwidth -gt 0 ]]; then
+        SMART_DETECTED_BANDWIDTH=$user_bandwidth
+        print_success "使用用户输入带宽: ${user_bandwidth} Mbps"
+    else
+        echo -e "${CYAN}正在自动检测带宽...${NC}"
+        detect_bandwidth >/dev/null 2>&1
+        print_kv "自动检测带宽" "${SMART_DETECTED_BANDWIDTH:-1000} Mbps"
+    fi
+    
+    # RTT 检测
     detect_rtt >/dev/null 2>&1
+    print_kv "检测 RTT" "${SMART_DETECTED_RTT:-100} ms"
+    
+    # 计算缓冲区
     calculate_bdp_buffer >/dev/null 2>&1
     local buffer_mb=$((SMART_OPTIMAL_BUFFER / 1024 / 1024))
     [[ $buffer_mb -eq 0 ]] && buffer_mb=64
-    print_kv "检测带宽" "${SMART_DETECTED_BANDWIDTH:-未知} Mbps"
-    print_kv "检测 RTT" "${SMART_DETECTED_RTT:-未知} ms"
     print_kv "推荐缓冲区" "${buffer_mb}MB"
     echo
     
