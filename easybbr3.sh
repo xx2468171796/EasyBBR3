@@ -3378,39 +3378,61 @@ get_line_sysctl_params() {
 
 # ========== UDP 优化（通话/视频）==========
 # 大 UDP 缓冲区支持实时音视频
-net.core.rmem_max = 26214400
-net.core.wmem_max = 26214400
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
 
 # ========== TCP 优化（消息/文件）==========
-# 快速响应小包
+# 大文件传输缓冲区（64MB，解决大文件中断问题）
+net.ipv4.tcp_rmem = 4096 131072 67108864
+net.ipv4.tcp_wmem = 4096 131072 67108864
+net.ipv4.tcp_mem = 786432 1048576 1572864
+
+# 快速响应
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_notsent_lowat = 8192
+net.ipv4.tcp_notsent_lowat = 131072
+
+# 窗口缩放（大文件必需）
+net.ipv4.tcp_window_scaling = 1
+net.core.optmem_max = 65536
 
 # 低延迟优先
 net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 
-# 快速重传
+# 快速重传和恢复
 net.ipv4.tcp_early_retrans = 3
 net.ipv4.tcp_frto = 2
+net.ipv4.tcp_retries1 = 3
+net.ipv4.tcp_retries2 = 15
+net.ipv4.tcp_orphan_retries = 3
+
+# ========== Keepalive 优化（防止大文件传输中断）==========
+net.ipv4.tcp_keepalive_time = 30
+net.ipv4.tcp_keepalive_intvl = 5
+net.ipv4.tcp_keepalive_probes = 9
 
 # ========== conntrack 优化 ==========
 # UDP 短超时（通话连接快速清理）
 net.netfilter.nf_conntrack_udp_timeout = 30
-net.netfilter.nf_conntrack_udp_timeout_stream = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 120
 
-# TCP 优化超时
-net.netfilter.nf_conntrack_tcp_timeout_established = 3600
-net.netfilter.nf_conntrack_tcp_timeout_time_wait = 15
+# TCP 长超时（大文件传输需要更长时间）
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_max = 1048576
 
 # ========== 队列优化（减少抖动）==========
 net.core.netdev_max_backlog = 250000
 net.core.netdev_budget = 600
 net.core.netdev_budget_usecs = 4000
+
+# ========== MTU 优化 ==========
+# 禁用 PMTU 黑洞检测（某些网络环境需要）
+net.ipv4.tcp_mtu_probing = 1
 EOF
 }
 
