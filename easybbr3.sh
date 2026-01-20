@@ -6788,7 +6788,7 @@ setup_time_based_optimization() {
     echo -e "${DIM}根据时段自动调整网络参数，晚高峰使用激进配置${NC}"
     echo
     echo "  【时段设置】"
-    echo "    晚高峰: 19:00 - 23:00 (激进模式)"
+    echo "    晚高峰: 19:00 - 02:00 (激进模式)"
     echo "    非高峰: 其他时间 (标准模式)"
     echo
     echo "  【激进模式参数】"
@@ -6807,7 +6807,7 @@ setup_time_based_optimization() {
     
     # 生成高峰模式配置
     cat > "$peak_config" << 'EOF'
-# BBR3 晚高峰模式 (19:00-23:00)
+# BBR3 晚高峰模式 (19:00-02:00)
 # 自动生成，请勿手动修改
 
 # 大缓冲区（128MB）
@@ -6847,8 +6847,8 @@ EOF
 #!/bin/bash
 # BBR3 时间自动切换脚本
 HOUR=$(date +%H)
-if [[ $HOUR -ge 19 && $HOUR -lt 23 ]]; then
-    # 晚高峰模式
+if [[ $HOUR -ge 19 || $HOUR -lt 2 ]]; then
+    # 晚高峰模式 (19:00-02:00)
     sysctl -p /etc/sysctl.d/99-bbr-peak.conf >/dev/null 2>&1
     logger "BBR3: 切换到晚高峰模式"
 else
