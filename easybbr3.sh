@@ -3352,29 +3352,55 @@ EOF
 # LINE 应用优化模块
 #===============================================================================
 
-# LINE 域名列表（包含文件服务器）
+# LINE 完整域名列表（来源：netify.ai）
 readonly LINE_DOMAINS=(
-    # 主域名
+    # ========== 主域名 ==========
     "line.me"
-    "line-scdn.net"
     "line-apps.com"
-    "naver.jp"
+    "line-scdn.net"
+    "lin.ee"
+    "linecorp.com"
+    "line.biz"
     "line.naver.jp"
-    # 文件/媒体服务器（关键！）
+    "naver.jp"
+    # ========== CDN 域名 ==========
+    "line-cdn.net"
+    "linecdn.net"
+    "scdn.line-apps.com"
+    # ========== 文件/媒体服务器（关键！）==========
     "obs.line-scdn.net"
     "obs-tw.line-scdn.net"
     "obs-jp.line-scdn.net"
+    "obs-sg.line-scdn.net"
     "stf.line-scdn.net"
     "w.line-scdn.net"
     "profile.line-scdn.net"
-    # 下载服务器
+    "media.line-scdn.net"
+    "vod.line-scdn.net"
+    # ========== 下载服务器 ==========
     "dl.stickershop.line.naver.jp"
-    "scdn.line-apps.com"
-    # API 和长连接
+    "stickershop.line-scdn.net"
+    "shop.line-scdn.net"
+    # ========== API 服务器 ==========
+    "api.line.me"
+    "access.line.me"
+    "notify-api.line.me"
     "gw.line.naver.jp"
+    # ========== 长连接服务器 ==========
     "legy.line.naver.jp"
     "legy-jp.line.naver.jp"
     "legy-tw.line.naver.jp"
+    "legy-sg.line.naver.jp"
+    "legy-hk.line.naver.jp"
+    # ========== 通话/VOIP 服务器 ==========
+    "voip.line-apps.com"
+    "turn.line-apps.com"
+    "stun.line-apps.com"
+    # ========== 其他服务 ==========
+    "d.line-scdn.net"
+    "static.line-scdn.net"
+    "liff.line.me"
+    "manager.line.biz"
 )
 
 # LINE 配置文件路径
