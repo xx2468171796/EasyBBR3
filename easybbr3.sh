@@ -99,7 +99,7 @@ readonly SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
 readonly BACKUP_DIR="/etc/sysctl.d/bbr-backups"
 readonly LOG_FILE="/var/log/bbr3-script.log"
 readonly LOG_MAX_SIZE=1048576  # 1MB
-readonly SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/xx2468171796/EasyBBR3/master/easybbr3.sh"
+readonly SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/xx2468171796/EasyBBR3/main/easybbr3.sh"
 
 #===============================================================================
 # 全局变量 - 系统信息
