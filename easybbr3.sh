@@ -1593,10 +1593,23 @@ detect_bandwidth() {
     nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
     if [[ -n "$nic" ]] && command -v ethtool >/dev/null 2>&1; then
         local nic_speed
-        nic_speed=$(ethtool "$nic" 2>/dev/null | awk -F': ' '/Speed:/{print $2}' | grep -oE '[0-9]+')
-        if [[ -n "$nic_speed" ]] && [[ $nic_speed -gt 0 ]]; then
+        # 尝试读取网卡速率，过滤掉 "Unknown" 等无效值
+        nic_speed=$(ethtool "$nic" 2>/dev/null | grep -i "Speed:" | grep -oE '[0-9]+' | head -1)
+        if [[ -n "$nic_speed" ]] && [[ $nic_speed -gt 0 ]] && [[ $nic_speed -lt 100000 ]]; then
             bandwidth=$nic_speed
             log_info "网卡速率: ${bandwidth} Mbps"
+        else
+            log_debug "ethtool 无法读取网卡速率（虚拟化环境常见）"
+        fi
+    fi
+    
+    # 方法1.5: 尝试从 /sys/class/net 读取速率（虚拟化环境备选）
+    if [[ $bandwidth -eq 0 ]] && [[ -n "$nic" ]] && [[ -f "/sys/class/net/$nic/speed" ]]; then
+        local sys_speed
+        sys_speed=$(cat "/sys/class/net/$nic/speed" 2>/dev/null)
+        if [[ -n "$sys_speed" ]] && [[ $sys_speed -gt 0 ]] && [[ $sys_speed -lt 100000 ]]; then
+            bandwidth=$sys_speed
+            log_info "网卡速率 (sysfs): ${bandwidth} Mbps"
         fi
     fi
     
