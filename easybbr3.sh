@@ -3286,6 +3286,14 @@ install_system_services() {
     for service in "${services_to_install[@]}"; do
         case "$service" in
             irqbalance)
+                # 检查是否为单核 CPU（irqbalance 在单核上无意义）
+                local cpu_count
+                cpu_count=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+                if [[ $cpu_count -le 1 ]]; then
+                    print_info "irqbalance 在单核 CPU 上不需要，已跳过"
+                    continue
+                fi
+                
                 if ! command -v irqbalance &>/dev/null; then
                     print_step "安装 irqbalance..."
                     case "$PKG_MANAGER" in
@@ -3638,11 +3646,16 @@ execute_optimization() {
     if [[ "$PROXY_ADVANCED_OPTS" == "all" ]]; then
         local irq_status="未运行"
         local haveged_status="未运行"
-        # 检查 irqbalance 状态（兼容容器环境）
+        local cpu_count
+        cpu_count=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+        
+        # 检查 irqbalance 状态（兼容容器/单核环境）
         if systemctl is-active irqbalance >/dev/null 2>&1; then
             irq_status="运行中"
         elif pgrep -x irqbalance >/dev/null 2>&1; then
             irq_status="运行中"
+        elif [[ $cpu_count -le 1 ]]; then
+            irq_status="单核CPU不需要"
         elif grep -qE '(docker|lxc|openvz|container)' /proc/1/cgroup 2>/dev/null || \
              [[ -f /.dockerenv ]] || systemd-detect-virt -c -q 2>/dev/null; then
             irq_status="容器环境不适用"
