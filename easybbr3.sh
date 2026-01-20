@@ -99,6 +99,7 @@ readonly SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
 readonly BACKUP_DIR="/etc/sysctl.d/bbr-backups"
 readonly LOG_FILE="/var/log/bbr3-script.log"
 readonly LOG_MAX_SIZE=1048576  # 1MB
+readonly SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/xx2468171796/EasyBBR3/master/easybbr3.sh"
 
 #===============================================================================
 # 全局变量 - 系统信息
@@ -6546,9 +6547,10 @@ show_main_menu() {
             "备份/恢复配置" \
             "卸载配置" \
             "安装快捷命令 bbr3" \
+            "更新脚本 (从 GitHub 获取最新版本)" \
             "PVE Tools 一键脚本"
         
-        read_choice "请选择" 8
+        read_choice "请选择" 9
         
         case "$MENU_CHOICE" in
             0) 
@@ -6562,7 +6564,8 @@ show_main_menu() {
             5) show_backup_menu ;;
             6) do_uninstall ;;
             7) install_shortcut ;;
-            8) run_pvetools ;;
+            8) update_script ;;
+            9) run_pvetools ;;
         esac
         
         echo
@@ -6737,6 +6740,75 @@ install_shortcut() {
         print_error "下载失败，请检查网络连接"
         return 1
     fi
+}
+
+# 更新脚本
+update_script() {
+    print_header "更新脚本"
+    
+    local current_script="$0"
+    local tmp_script="/tmp/easybbr3_new.sh"
+    
+    echo -e "${DIM}从 GitHub 下载最新版本...${NC}"
+    echo
+    
+    # 下载最新版本
+    if curl -fsSL "$SCRIPT_UPDATE_URL" -o "$tmp_script" 2>/dev/null; then
+        :
+    elif wget -qO "$tmp_script" "$SCRIPT_UPDATE_URL" 2>/dev/null; then
+        :
+    else
+        print_error "下载失败，请检查网络连接"
+        return 1
+    fi
+    
+    # 检查下载的文件是否有效
+    if ! head -1 "$tmp_script" | grep -q "#!/"; then
+        print_error "下载的文件无效"
+        rm -f "$tmp_script"
+        return 1
+    fi
+    
+    # 获取版本信息
+    local new_version
+    new_version=$(grep -m1 'SCRIPT_VERSION=' "$tmp_script" | cut -d'"' -f2)
+    print_kv "当前版本" "$SCRIPT_VERSION"
+    print_kv "最新版本" "${new_version:-未知}"
+    echo
+    
+    if [[ "$new_version" == "$SCRIPT_VERSION" ]]; then
+        print_info "已是最新版本，无需更新"
+        rm -f "$tmp_script"
+        return 0
+    fi
+    
+    if ! confirm "是否更新到最新版本？" "y"; then
+        rm -f "$tmp_script"
+        return 0
+    fi
+    
+    # 备份当前脚本
+    if [[ -f "$current_script" ]]; then
+        cp "$current_script" "${current_script}.bak"
+        print_info "已备份当前脚本到 ${current_script}.bak"
+    fi
+    
+    # 替换脚本
+    chmod +x "$tmp_script"
+    mv "$tmp_script" "$current_script"
+    
+    # 同时更新快捷命令（如果存在）
+    if [[ -f /usr/local/bin/bbr3 ]]; then
+        cp "$current_script" /usr/local/bin/bbr3
+        chmod +x /usr/local/bin/bbr3
+        print_info "已同步更新快捷命令 bbr3"
+    fi
+    
+    print_success "脚本更新成功！"
+    echo
+    print_info "请重新运行脚本以使用新版本"
+    
+    exit 0
 }
 
 # 卸载快捷命令
