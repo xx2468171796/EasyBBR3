@@ -1990,6 +1990,7 @@ get_scene_name() {
         speed)         echo "极速模式" ;;
         performance)   echo "性能模式" ;;
         proxy)         echo "代理模式" ;;
+        line)          echo "LINE优化" ;;
         *)             echo "未知模式" ;;
     esac
 }
@@ -2018,6 +2019,9 @@ get_scene_description() {
             ;;
         proxy)
             echo "专为代理/VPN优化，抗丢包、低延迟、高吞吐"
+            ;;
+        line)
+            echo "专为LINE优化，通话优先、文件传输、消息加速"
             ;;
     esac
 }
@@ -2150,6 +2154,23 @@ get_scene_params() {
             tcp_low_latency=1       # 低延迟模式
             tcp_slow_start=0        # 禁用慢启动（重连更快）
             tcp_notsent_lowat=16384 # 较小值减少延迟
+            ;;
+        line)
+            # LINE 优化模式 - 专为 LINE 应用优化
+            # 优先级：通话 > 文件传输 > 消息
+            # 特点：UDP 优化、低抖动、快速响应
+            rmem_max=$((max_buffer * 2 / 3))
+            wmem_max=$((max_buffer * 2 / 3))
+            tcp_rmem_high=$((max_buffer * 2 / 3))
+            tcp_wmem_high=$((max_buffer * 2 / 3))
+            somaxconn=$((base_somaxconn * 2))
+            [[ $somaxconn -gt 65535 ]] && somaxconn=65535
+            netdev_backlog=$((base_backlog * 2))
+            [[ $netdev_backlog -gt 1000000 ]] && netdev_backlog=1000000
+            tcp_fastopen=3          # TFO 加速消息发送
+            tcp_low_latency=1       # 低延迟优先（通话）
+            tcp_slow_start=0        # 禁用慢启动（快速恢复）
+            tcp_notsent_lowat=8192  # 更小值减少通话延迟
             ;;
     esac
     
@@ -3325,6 +3346,436 @@ net.ipv4.tcp_keepalive_probes = 6
 # 路由缓存优化
 net.ipv4.route.max_size = 2147483647
 EOF
+}
+
+#===============================================================================
+# LINE 应用优化模块
+#===============================================================================
+
+# LINE 域名列表
+readonly LINE_DOMAINS=(
+    "line.me"
+    "line-scdn.net"
+    "line-apps.com"
+    "naver.jp"
+    "line.naver.jp"
+    "obs.line-scdn.net"
+    "stf.line-scdn.net"
+    "w.line-scdn.net"
+    "profile.line-scdn.net"
+)
+
+# LINE 配置文件路径
+readonly LINE_CONFIG_FILE="/etc/bbr3-line.conf"
+readonly LINE_IP_FILE="/etc/bbr3-line-ips.conf"
+readonly LINE_SYSCTL_FILE="/etc/sysctl.d/99-bbr-line.conf"
+
+# 获取 LINE 专用 sysctl 参数
+get_line_sysctl_params() {
+    cat << 'EOF'
+# LINE 应用专项优化
+# 优先级：通话 > 文件传输 > 消息
+
+# ========== UDP 优化（通话/视频）==========
+# 大 UDP 缓冲区支持实时音视频
+net.core.rmem_max = 26214400
+net.core.wmem_max = 26214400
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+
+# ========== TCP 优化（消息/文件）==========
+# 快速响应小包
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 8192
+
+# 低延迟优先
+net.ipv4.tcp_low_latency = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+
+# 快速重传
+net.ipv4.tcp_early_retrans = 3
+net.ipv4.tcp_frto = 2
+
+# ========== conntrack 优化 ==========
+# UDP 短超时（通话连接快速清理）
+net.netfilter.nf_conntrack_udp_timeout = 30
+net.netfilter.nf_conntrack_udp_timeout_stream = 60
+
+# TCP 优化超时
+net.netfilter.nf_conntrack_tcp_timeout_established = 3600
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 15
+
+# ========== 队列优化（减少抖动）==========
+net.core.netdev_max_backlog = 250000
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 4000
+EOF
+}
+
+# LINE DNS 预解析
+line_dns_prefetch() {
+    log_info "执行 LINE DNS 预解析..."
+    
+    local resolved_ips=""
+    for domain in "${LINE_DOMAINS[@]}"; do
+        local ips
+        ips=$(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -5)
+        if [[ -n "$ips" ]]; then
+            resolved_ips+="$ips"$'\n'
+            log_debug "解析 $domain: $(echo "$ips" | tr '\n' ' ')"
+        fi
+    done
+    
+    # 保存 IP 列表
+    if [[ -n "$resolved_ips" ]]; then
+        echo "$resolved_ips" | sort -u > "$LINE_IP_FILE"
+        local count
+        count=$(wc -l < "$LINE_IP_FILE")
+        print_success "DNS 预解析完成，获取 $count 个 IP"
+    else
+        print_warn "DNS 预解析失败，请检查网络"
+    fi
+}
+
+# LINE TCP 预热
+line_tcp_warmup() {
+    log_info "执行 LINE TCP 预热..."
+    
+    if [[ ! -f "$LINE_IP_FILE" ]]; then
+        line_dns_prefetch
+    fi
+    
+    if [[ ! -f "$LINE_IP_FILE" ]]; then
+        print_warn "无 IP 列表，跳过 TCP 预热"
+        return
+    fi
+    
+    local warmup_count=0
+    while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        # 尝试建立 TCP 连接（443 端口）
+        if timeout 2 bash -c "echo >/dev/tcp/$ip/443" 2>/dev/null; then
+            ((warmup_count++))
+            log_debug "预热成功: $ip"
+        fi
+    done < "$LINE_IP_FILE"
+    
+    print_success "TCP 预热完成，成功 $warmup_count 个连接"
+}
+
+# 创建 LINE keepalive 服务
+line_create_keepalive_service() {
+    log_info "创建 LINE keepalive 服务..."
+    
+    # 创建预热脚本
+    local warmup_script="/usr/local/bin/bbr3-line-warmup"
+    cat > "$warmup_script" << 'SCRIPT'
+#!/bin/bash
+# LINE 连接预热脚本
+
+LINE_DOMAINS=(
+    "line.me"
+    "line-scdn.net"
+    "line-apps.com"
+    "naver.jp"
+)
+LINE_IP_FILE="/etc/bbr3-line-ips.conf"
+
+# DNS 预解析
+resolved_ips=""
+for domain in "${LINE_DOMAINS[@]}"; do
+    ips=$(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -5)
+    [[ -n "$ips" ]] && resolved_ips+="$ips"$'\n'
+done
+[[ -n "$resolved_ips" ]] && echo "$resolved_ips" | sort -u > "$LINE_IP_FILE"
+
+# TCP 预热
+[[ -f "$LINE_IP_FILE" ]] && while read -r ip; do
+    [[ -n "$ip" ]] && timeout 2 bash -c "echo >/dev/tcp/$ip/443" 2>/dev/null
+done < "$LINE_IP_FILE"
+
+logger "BBR3-LINE: 预热完成"
+SCRIPT
+    chmod +x "$warmup_script"
+    
+    # 创建 systemd 服务
+    cat > /etc/systemd/system/bbr3-line-warmup.service << SERVICE
+[Unit]
+Description=BBR3 LINE Connection Warmup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$warmup_script
+SERVICE
+    
+    # 创建定时器（每 5 分钟执行）
+    cat > /etc/systemd/system/bbr3-line-warmup.timer << TIMER
+[Unit]
+Description=BBR3 LINE Warmup Timer
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=300
+
+[Install]
+WantedBy=timers.target
+TIMER
+    
+    # 启用服务
+    systemctl daemon-reload
+    systemctl enable bbr3-line-warmup.timer >/dev/null 2>&1
+    systemctl start bbr3-line-warmup.timer >/dev/null 2>&1
+    
+    print_success "LINE keepalive 服务已创建并启用"
+}
+
+# LINE 路由优化
+line_route_optimize() {
+    log_info "配置 LINE 路由优化..."
+    
+    if [[ ! -f "$LINE_IP_FILE" ]]; then
+        line_dns_prefetch
+    fi
+    
+    if [[ ! -f "$LINE_IP_FILE" ]]; then
+        print_warn "无 IP 列表，跳过路由优化"
+        return
+    fi
+    
+    # 获取默认网关
+    local gateway
+    gateway=$(ip route | grep default | awk '{print $3}' | head -1)
+    local nic
+    nic=$(ip route | grep default | awk '{print $5}' | head -1)
+    
+    if [[ -z "$gateway" ]] || [[ -z "$nic" ]]; then
+        print_warn "无法获取默认网关，跳过路由优化"
+        return
+    fi
+    
+    local route_count=0
+    while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        # 添加高优先级路由
+        if ip route add "$ip/32" via "$gateway" dev "$nic" metric 10 2>/dev/null; then
+            ((route_count++))
+        fi
+    done < "$LINE_IP_FILE"
+    
+    print_success "路由优化完成，添加 $route_count 条路由"
+}
+
+# LINE QoS 设置
+line_qos_setup() {
+    log_info "配置 LINE QoS..."
+    
+    if [[ ! -f "$LINE_IP_FILE" ]]; then
+        line_dns_prefetch
+    fi
+    
+    if [[ ! -f "$LINE_IP_FILE" ]]; then
+        print_warn "无 IP 列表，跳过 QoS 设置"
+        return
+    fi
+    
+    # 检查 iptables
+    if ! command -v iptables >/dev/null 2>&1; then
+        print_warn "iptables 未安装，跳过 QoS 设置"
+        return
+    fi
+    
+    # 创建 LINE 专用链
+    iptables -t mangle -N LINE_QOS 2>/dev/null || iptables -t mangle -F LINE_QOS
+    
+    # 为 LINE IP 设置 DSCP 标记（EF = 46，用于实时流量）
+    while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        iptables -t mangle -A LINE_QOS -d "$ip" -j DSCP --set-dscp 46 2>/dev/null
+        iptables -t mangle -A LINE_QOS -s "$ip" -j DSCP --set-dscp 46 2>/dev/null
+    done < "$LINE_IP_FILE"
+    
+    # 将 LINE_QOS 链添加到 POSTROUTING
+    iptables -t mangle -C POSTROUTING -j LINE_QOS 2>/dev/null || \
+        iptables -t mangle -A POSTROUTING -j LINE_QOS
+    
+    print_success "LINE QoS 已配置（DSCP=EF）"
+}
+
+# LINE 优化菜单
+line_optimization_menu() {
+    while true; do
+        clear
+        print_header "LINE 应用优化"
+        
+        echo -e "${DIM}专为 LINE 应用优化，提升通话质量和文件传输速度${NC}"
+        echo -e "${DIM}优先级：通话 > 文件传输 > 消息${NC}"
+        echo
+        
+        # 显示当前状态
+        echo -e "  ${BOLD}当前状态:${NC}"
+        if [[ -f "$LINE_SYSCTL_FILE" ]]; then
+            echo -e "    LINE sysctl: ${GREEN}已配置${NC}"
+        else
+            echo -e "    LINE sysctl: ${YELLOW}未配置${NC}"
+        fi
+        if systemctl is-active bbr3-line-warmup.timer >/dev/null 2>&1; then
+            echo -e "    预热服务: ${GREEN}运行中${NC}"
+        else
+            echo -e "    预热服务: ${YELLOW}未启用${NC}"
+        fi
+        if [[ -f "$LINE_IP_FILE" ]]; then
+            local ip_count
+            ip_count=$(wc -l < "$LINE_IP_FILE")
+            echo -e "    IP 列表: ${GREEN}${ip_count} 个${NC}"
+        else
+            echo -e "    IP 列表: ${YELLOW}未生成${NC}"
+        fi
+        echo
+        
+        print_separator
+        echo
+        echo -e "  ${GREEN}${BOLD}1)${NC} ${GREEN}🚀 一键优化${NC}     - 应用所有 LINE 优化（推荐）"
+        echo -e "  ${CYAN}2)${NC} 📝 基础优化     - 仅应用 sysctl 参数"
+        echo -e "  ${CYAN}3)${NC} 🔄 DNS 预解析   - 更新 LINE IP 列表"
+        echo -e "  ${CYAN}4)${NC} 🔥 TCP 预热     - 预热 LINE 连接"
+        echo -e "  ${CYAN}5)${NC} ⏰ 启用预热服务 - 定时自动预热"
+        echo -e "  ${CYAN}6)${NC} 🛣️  路由优化     - 优化 LINE IP 路由"
+        echo -e "  ${CYAN}7)${NC} 📊 QoS 设置     - 设置流量优先级"
+        echo -e "  ${CYAN}8)${NC} ❌ 移除优化     - 移除所有 LINE 优化"
+        echo
+        echo -e "  ${CYAN}0)${NC} 返回上级菜单"
+        echo
+        
+        read_choice "请选择" 8
+        
+        case "$MENU_CHOICE" in
+            0) return ;;
+            1) line_full_optimize ;;
+            2) line_apply_sysctl ;;
+            3) line_dns_prefetch ;;
+            4) line_tcp_warmup ;;
+            5) line_create_keepalive_service ;;
+            6) line_route_optimize ;;
+            7) line_qos_setup ;;
+            8) line_remove_optimization ;;
+        esac
+        
+        echo
+        read -rp "按 Enter 键继续..."
+    done
+}
+
+# LINE 一键优化
+line_full_optimize() {
+    print_header "LINE 一键优化"
+    
+    echo -e "${CYAN}将执行以下优化:${NC}"
+    echo "  1. 应用 LINE 专用 sysctl 参数"
+    echo "  2. DNS 预解析获取 LINE IP"
+    echo "  3. TCP 连接预热"
+    echo "  4. 创建定时预热服务"
+    echo "  5. 配置路由优化"
+    echo "  6. 设置 QoS 流量优先级"
+    echo
+    
+    if ! confirm "确认执行一键优化？" "y"; then
+        return
+    fi
+    
+    echo
+    print_step "[1/6] 应用 sysctl 参数..."
+    line_apply_sysctl
+    
+    print_step "[2/6] DNS 预解析..."
+    line_dns_prefetch
+    
+    print_step "[3/6] TCP 预热..."
+    line_tcp_warmup
+    
+    print_step "[4/6] 创建预热服务..."
+    line_create_keepalive_service
+    
+    print_step "[5/6] 路由优化..."
+    line_route_optimize
+    
+    print_step "[6/6] QoS 设置..."
+    line_qos_setup
+    
+    echo
+    echo -e "${GREEN}${BOLD}${ICON_OK} LINE 一键优化完成！${NC}"
+    echo
+    echo -e "  ${BOLD}优化摘要:${NC}"
+    echo "    - sysctl 配置: ${LINE_SYSCTL_FILE}"
+    echo "    - IP 列表: ${LINE_IP_FILE}"
+    echo "    - 预热服务: bbr3-line-warmup.timer"
+    echo "    - QoS: DSCP=EF (实时流量优先)"
+    echo
+    echo -e "  ${DIM}提示: LINE 优化与代理模式可同时使用${NC}"
+}
+
+# 应用 LINE sysctl 参数
+line_apply_sysctl() {
+    log_info "应用 LINE sysctl 参数..."
+    
+    # 生成配置文件
+    cat > "$LINE_SYSCTL_FILE" << CONF
+# LINE 应用专项优化
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+# 由 BBR3 Script 生成
+
+$(get_line_sysctl_params)
+CONF
+    
+    # 应用配置
+    if sysctl -p "$LINE_SYSCTL_FILE" >/dev/null 2>&1; then
+        print_success "LINE sysctl 参数已应用"
+    else
+        # 逐行应用
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ ^# ]] && continue
+            sysctl -w "$line" >/dev/null 2>&1 || true
+        done < "$LINE_SYSCTL_FILE"
+        print_success "LINE sysctl 参数已应用（部分参数可能不支持）"
+    fi
+}
+
+# 移除 LINE 优化
+line_remove_optimization() {
+    print_header "移除 LINE 优化"
+    
+    if ! confirm "确认移除所有 LINE 优化？" "n"; then
+        return
+    fi
+    
+    echo
+    print_step "移除 sysctl 配置..."
+    rm -f "$LINE_SYSCTL_FILE"
+    sysctl --system >/dev/null 2>&1
+    
+    print_step "停止预热服务..."
+    systemctl stop bbr3-line-warmup.timer 2>/dev/null
+    systemctl disable bbr3-line-warmup.timer 2>/dev/null
+    rm -f /etc/systemd/system/bbr3-line-warmup.service
+    rm -f /etc/systemd/system/bbr3-line-warmup.timer
+    rm -f /usr/local/bin/bbr3-line-warmup
+    systemctl daemon-reload
+    
+    print_step "移除 IP 列表..."
+    rm -f "$LINE_IP_FILE"
+    rm -f "$LINE_CONFIG_FILE"
+    
+    print_step "移除 QoS 规则..."
+    iptables -t mangle -D POSTROUTING -j LINE_QOS 2>/dev/null
+    iptables -t mangle -F LINE_QOS 2>/dev/null
+    iptables -t mangle -X LINE_QOS 2>/dev/null
+    
+    echo
+    print_success "LINE 优化已移除"
 }
 
 # 安装系统服务
@@ -4631,10 +5082,14 @@ scene_config_menu() {
         echo -e "  ${CYAN}10)${NC} 极速模式   - 最大化吞吐量，适合大带宽服务器"
         echo -e "  ${CYAN}11)${NC} 性能模式   - 全面性能优化，适合高性能计算"
         echo
+        print_separator
+        echo -e "  ${DIM}应用专项优化:${NC}"
+        echo -e "  ${GREEN}12)${NC} ${GREEN}📱 LINE优化${NC}  - 专为LINE优化，通话/文件/消息加速"
+        echo
         echo -e "  ${CYAN}0)${NC} 返回主菜单"
         echo
         
-        read_choice "请选择场景模式" 11
+        read_choice "请选择场景模式" 12
         
         local selected_mode=""
         case "$MENU_CHOICE" in
@@ -4650,6 +5105,7 @@ scene_config_menu() {
             9) selected_mode="concurrent" ;;
             10) selected_mode="speed" ;;
             11) selected_mode="performance" ;;
+            12) line_optimization_menu; continue ;;
             *) continue ;;
         esac
         
