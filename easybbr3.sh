@@ -3348,6 +3348,174 @@ net.ipv4.route.max_size = 2147483647
 EOF
 }
 
+# 获取抗丢包优化参数（中转机/高丢包环境专用）
+get_anti_loss_sysctl_params() {
+    cat << 'EOF'
+# ========== 抗丢包优化（中转机/高丢包环境）==========
+# 适用场景：中转机、跨国线路、丢包率 5-15% 的环境
+
+# 拥塞控制（BBR 对丢包不敏感）
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+
+# ========== 核心抗丢包参数 ==========
+# 增加 TCP 重传次数（默认 15，高丢包环境需要更多）
+net.ipv4.tcp_retries1 = 5
+net.ipv4.tcp_retries2 = 30
+
+# 增加 SYN 重试次数（默认 6）
+net.ipv4.tcp_syn_retries = 6
+net.ipv4.tcp_synack_retries = 6
+
+# 增加孤儿连接重试（默认 0）
+net.ipv4.tcp_orphan_retries = 5
+
+# ========== 缓冲区优化（应对突发丢包）==========
+# 更大的缓冲区可以容纳更多待重传数据
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 1048576 134217728
+net.ipv4.tcp_wmem = 4096 1048576 134217728
+
+# ========== SACK/DSACK 优化（选择性确认）==========
+# 启用 SACK 可以只重传丢失的包，而不是整个窗口
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_fack = 1
+
+# ========== 时间戳和窗口缩放 ==========
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_window_scaling = 1
+
+# ========== 网络队列优化（防止队列溢出丢包）==========
+net.core.netdev_max_backlog = 65535
+net.core.netdev_budget = 1200
+net.core.netdev_budget_usecs = 16000
+
+# ========== 连接队列优化 ==========
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# ========== Keepalive 优化（检测死连接）==========
+net.ipv4.tcp_keepalive_time = 30
+net.ipv4.tcp_keepalive_intvl = 5
+net.ipv4.tcp_keepalive_probes = 9
+
+# ========== 超时优化 ==========
+net.ipv4.tcp_fin_timeout = 30
+
+# ========== MTU 探测（自动适应路径 MTU）==========
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1024
+
+# ========== ECN 显式拥塞通知 ==========
+net.ipv4.tcp_ecn = 2
+net.ipv4.tcp_ecn_fallback = 1
+
+# ========== 其他优化 ==========
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_tw_reuse = 1
+
+# ========== 连接跟踪优化 ==========
+net.netfilter.nf_conntrack_max = 2097152
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+EOF
+}
+
+# 应用抗丢包优化
+apply_anti_loss_optimization() {
+    print_header "抗丢包优化（中转机专用）"
+    
+    echo -e "${CYAN}此优化适用于:${NC}"
+    echo "  • 中转机/落地机场景"
+    echo "  • 跨国线路丢包率 5-15%"
+    echo "  • 连接不稳定、频繁断线"
+    echo "  • ICMP 丢包严重"
+    echo
+    
+    echo -e "${BOLD}优化内容:${NC}"
+    echo "  • TCP 重传次数: 15 → 30"
+    echo "  • SYN 重试次数: 2 → 6"
+    echo "  • 缓冲区: 64MB → 128MB"
+    echo "  • 网络队列: 5000 → 65535"
+    echo "  • Keepalive: 更频繁检测"
+    echo "  • MTU 探测: 自动适应"
+    echo
+    
+    if ! confirm "确认应用抗丢包优化？" "y"; then
+        return
+    fi
+    
+    echo
+    
+    # 备份当前配置
+    backup_config
+    
+    # 生成配置文件
+    local anti_loss_file="/etc/sysctl.d/99-bbr-anti-loss.conf"
+    
+    cat > "$anti_loss_file" << CONF
+# BBR3 抗丢包优化配置
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+# 适用场景: 中转机/高丢包环境
+
+$(get_anti_loss_sysctl_params)
+CONF
+    
+    # 应用配置
+    print_step "应用抗丢包参数..."
+    
+    local applied=0 errors=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if sysctl -w "$line" >/dev/null 2>&1; then
+            ((++applied))
+        else
+            ((++errors))
+        fi
+    done < "$anti_loss_file"
+    
+    if [[ $errors -gt 0 ]]; then
+        print_info "已应用 ${applied} 项，${errors} 项不被当前内核支持"
+    else
+        print_success "抗丢包参数已全部应用"
+    fi
+    
+    # 优化网卡队列
+    print_step "优化网卡队列..."
+    local nic
+    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    if [[ -n "$nic" ]]; then
+        # 增加网卡队列长度
+        ip link set "$nic" txqueuelen 10000 2>/dev/null && \
+            print_success "网卡 $nic 队列长度已设置为 10000" || \
+            print_warn "无法设置网卡队列长度"
+        
+        # 尝试启用 GRO/GSO
+        ethtool -K "$nic" gro on 2>/dev/null
+        ethtool -K "$nic" gso on 2>/dev/null
+        ethtool -K "$nic" tso on 2>/dev/null
+    fi
+    
+    echo
+    echo -e "${GREEN}${BOLD}${ICON_OK} 抗丢包优化完成！${NC}"
+    echo
+    echo -e "  ${BOLD}配置文件:${NC} ${anti_loss_file}"
+    echo
+    echo -e "  ${BOLD}验证命令:${NC}"
+    echo "    sysctl net.ipv4.tcp_retries2  # 应为 30"
+    echo "    sysctl net.core.rmem_max      # 应为 134217728"
+    echo
+    echo -e "  ${YELLOW}注意:${NC} 如果丢包仍然严重，可能是线路本身问题，建议:"
+    echo "    1. 更换线路/机房"
+    echo "    2. 使用 UDP 协议（如 Hysteria/TUIC）"
+    echo "    3. 检查是否被 QoS 限速"
+}
+
 #===============================================================================
 # LINE 应用优化模块
 #===============================================================================
@@ -5570,11 +5738,12 @@ scene_config_menu() {
         print_separator
         echo -e "  ${DIM}应用专项优化:${NC}"
         echo -e "  ${GREEN}12)${NC} ${GREEN}📱 应用优化${NC}  - LINE/Google/Apple/Meta/X/Telegram"
+        echo -e "  ${YELLOW}13)${NC} ${YELLOW}🛡️  抗丢包${NC}   - 中转机/高丢包环境专用"
         echo
         echo -e "  ${CYAN}0)${NC} 返回主菜单"
         echo
         
-        read_choice "请选择场景模式" 12
+        read_choice "请选择场景模式" 13
         
         local selected_mode=""
         case "$MENU_CHOICE" in
@@ -5591,6 +5760,7 @@ scene_config_menu() {
             10) selected_mode="speed" ;;
             11) selected_mode="performance" ;;
             12) app_optimization_menu; continue ;;
+            13) apply_anti_loss_optimization; continue ;;
             *) continue ;;
         esac
         
