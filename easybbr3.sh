@@ -12,9 +12,9 @@
 #       OPTIONS: --help 查看完整帮助
 #  REQUIREMENTS: root 权限, bash 4.0+
 #        AUTHOR: 孤独制作
-#       VERSION: 2.0.1
+#       VERSION: 2.1.1
 #       CREATED: 2024
-#      REVISION: 2024-11-29
+#      REVISION: 2026-04-14
 #       LICENSE: MIT
 #      TELEGRAM: https://t.me/+RZMe7fnvvUg1OWJl
 #        GITHUB: https://github.com/xx2468171796
@@ -45,7 +45,7 @@ fi
 #===============================================================================
 # 版本信息
 #===============================================================================
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.1.1"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 readonly GITHUB_URL="https://github.com/xx2468171796"
@@ -97,7 +97,8 @@ readonly ICON_CPU="🖥"
 #===============================================================================
 readonly SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
 readonly BACKUP_DIR="/etc/sysctl.d/bbr-backups"
-readonly LOG_FILE="/var/log/bbr3-script.log"
+# LOG_FILE 不是 readonly: log_init 检测到符号链接攻击时可能改写为 fallback 路径
+LOG_FILE="/var/log/bbr3-script.log"
 readonly LOG_MAX_SIZE=1048576  # 1MB
 readonly SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/xx2468171796/EasyBBR3/main/easybbr3.sh"
 
@@ -142,6 +143,7 @@ DEBUG_MODE=0
 PIPE_MODE=0
 MENU_CHOICE=""
 APPLY_GUIDANCE_SHOWN=0
+ALLOW_UNVERIFIED_UPDATE=0
 
 #===============================================================================
 # 全局变量 - 缓冲区调优
@@ -456,25 +458,47 @@ read_choice() {
 #===============================================================================
 
 # 初始化日志
+#
+# 安全说明 (v2.1.1): >> 跟随符号链接,原代码可被本地非特权用户事先在
+# /var/log/bbr3-script.log 处放符号链接到敏感文件(/etc/shadow 等),
+# 然后等管理员以 root 运行脚本时,日志写入会附加到目标文件。
+# 因此写入前必须确保 LOG_FILE 不是符号链接,若是则禁用日志或换用专属目录。
 log_init() {
     local log_dir
     log_dir="$(dirname "$LOG_FILE")"
-    
+
     # 创建日志目录
     if [[ ! -d "$log_dir" ]]; then
         mkdir -p "$log_dir" 2>/dev/null || true
     fi
-    
+
+    # 拒绝符号链接 - 若是,改用 /tmp 下的独占文件,避免提权写入风险
+    if [[ -L "$LOG_FILE" ]]; then
+        local fallback
+        fallback=$(mktemp /tmp/bbr3-script-XXXXXX.log 2>/dev/null) || fallback=""
+        if [[ -n "$fallback" ]]; then
+            LOG_FILE="$fallback"
+        else
+            LOG_FILE="/dev/null"
+        fi
+    fi
+
     # 日志轮转
-    if [[ -f "$LOG_FILE" ]]; then
+    if [[ -f "$LOG_FILE" && ! -L "$LOG_FILE" ]]; then
         local size
         # Linux 使用 -c%s，macOS/BSD 使用 -f%z
         size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
         if [[ $size -gt $LOG_MAX_SIZE ]]; then
-            mv "$LOG_FILE" "${LOG_FILE}.old" 2>/dev/null || true
+            mv -- "$LOG_FILE" "${LOG_FILE}.old" 2>/dev/null || true
         fi
     fi
-    
+
+    # 创建新 log 文件,显式 0640 权限,O_NOFOLLOW 行为通过先 rm 再 touch 模拟
+    if [[ "$LOG_FILE" != "/dev/null" ]]; then
+        # 即使被竞争创建为符号链接,install -m 也会拒绝写入符号链接目标
+        install -m 0640 /dev/null "$LOG_FILE" 2>/dev/null || true
+    fi
+
     # 写入日志头
     {
         echo "========================================"
@@ -491,7 +515,11 @@ _log() {
     local msg="$*"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    
+
+    # 转义换行/回车防止 log injection 污染后续行
+    msg=${msg//$'\n'/ }
+    msg=${msg//$'\r'/ }
+
     echo "[${timestamp}] [${level}] ${msg}" >> "$LOG_FILE" 2>/dev/null || true
 }
 
@@ -560,8 +588,35 @@ setup_traps() {
     trap 'die "收到终止信号" 143' TERM
 }
 
-# 安全执行命令（允许失败）
+# 临界区: 屏蔽 SIGINT/SIGTERM 防止 Ctrl-C 留下半生成的 initramfs 或半写的 grub.cfg
+# 使用方式:
+#   critical_section_enter
+#   trap critical_section_exit RETURN  # 或手动配对
+#   ... 危险命令 ...
+#   critical_section_exit
+CRITICAL_SECTION_DEPTH=0
+critical_section_enter() {
+    if [[ $CRITICAL_SECTION_DEPTH -eq 0 ]]; then
+        trap '' INT TERM
+    fi
+    ((++CRITICAL_SECTION_DEPTH))
+}
+critical_section_exit() {
+    if [[ $CRITICAL_SECTION_DEPTH -gt 0 ]]; then
+        ((--CRITICAL_SECTION_DEPTH))
+    fi
+    if [[ $CRITICAL_SECTION_DEPTH -eq 0 ]]; then
+        trap 'echo; die "用户中断操作" 130' INT
+        trap 'die "收到终止信号" 143' TERM
+    fi
+}
+
+# 安全执行命令（允许失败）- 名字保留 v2.1.0 兼容,实际是 ignore_errors
 safe_run() {
+    "$@" || true
+}
+# 推荐新代码使用这个更清晰的别名
+ignore_errors() {
     "$@" || true
 }
 
@@ -1171,52 +1226,80 @@ check_package_source() {
 }
 
 # 修复 APT 源问题
+#
+# v2.1.1 强化:
+#  1. 不再 rm -rf /var/lib/apt/lists/* (在新源生效前删 cache 是逆序操作,
+#     失败时连降级路径都没了)。改用 apt-get clean 仅清 deb 文件
+#  2. 写新 sources.list 用临时文件 + mv 原子替换
+#  3. 临界区屏蔽 SIGINT
 fix_apt_source() {
     log_info "尝试修复 APT 源..."
-    
-    # 备份当前源
-    local backup_file="/etc/apt/sources.list.bak.$(date +%Y%m%d%H%M%S)"
-    cp /etc/apt/sources.list "$backup_file" 2>/dev/null || true
-    
-    # 清理 APT 缓存
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
-    
+
+    local sources_file="/etc/apt/sources.list"
+    local backup_file="${sources_file}.bak.$(date +%Y%m%d%H%M%S)"
+
+    # 备份当前源 - 失败硬终止,否则后续无法恢复
+    if ! cp -- "$sources_file" "$backup_file" 2>/dev/null; then
+        log_error "备份 $sources_file 失败,中止修复"
+        return 1
+    fi
+
+    # 仅清 .deb 缓存,保留 lists/ 直到新源验证通过
+    apt-get clean 2>/dev/null || true
+
     # 如果是国内环境，尝试切换到国内镜像
     if [[ $USE_CHINA_MIRROR -eq 1 ]]; then
         print_info "尝试切换到国内镜像源..."
-        
-        # 检测当前系统
+
         local codename="${DIST_CODENAME:-$(lsb_release -cs 2>/dev/null || echo 'stable')}"
-        
+        local new_content=""
+
         case "$DIST_ID" in
             debian)
-                cat > /etc/apt/sources.list << EOF
-deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${codename} main contrib non-free
+                new_content="deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${codename} main contrib non-free
 deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${codename}-updates main contrib non-free
 deb https://mirrors.tuna.tsinghua.edu.cn/debian-security ${codename}-security main contrib non-free
-EOF
+"
                 ;;
             ubuntu)
-                cat > /etc/apt/sources.list << EOF
-deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ ${codename} main restricted universe multiverse
+                new_content="deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ ${codename} main restricted universe multiverse
 deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ ${codename}-updates main restricted universe multiverse
 deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ ${codename}-security main restricted universe multiverse
-EOF
+"
                 ;;
         esac
+
+        if [[ -n "$new_content" ]]; then
+            critical_section_enter
+            local tmp_file="${sources_file}.bbr3.new"
+            if printf '%s' "$new_content" > "$tmp_file" \
+                && mv -f -- "$tmp_file" "$sources_file"; then
+                :
+            else
+                rm -f -- "$tmp_file"
+                critical_section_exit
+                log_error "写入新 sources.list 失败,恢复备份"
+                cp -- "$backup_file" "$sources_file" 2>/dev/null || true
+                return 1
+            fi
+            critical_section_exit
+        fi
     fi
-    
-    # 重新更新
+
+    # 重新更新 - 失败必须恢复 backup
     local apt_output
     apt_output=$(apt-get update -qq 2>&1)
     if echo "$apt_output" | grep -qE '(Failed|Error)'; then
         log_warn "修复后仍有问题，恢复原配置"
-        [[ -f "$backup_file" ]] && cp "$backup_file" /etc/apt/sources.list
+        if [[ -f "$backup_file" ]]; then
+            critical_section_enter
+            cp -- "$backup_file" "$sources_file" 2>/dev/null || true
+            critical_section_exit
+        fi
         return 1
     fi
     APT_UPDATE_DONE=1
-    
+
     print_success "APT 源修复成功"
     return 0
 }
@@ -1443,24 +1526,33 @@ run_precheck() {
 # 备份当前配置
 backup_config() {
     log_debug "备份当前配置..."
-    
-    # 创建备份目录
+
+    # 创建备份目录 - 失败必须返回非零，否则后续 write_sysctl 会以为
+    # 备份成功而直接覆写原文件，导致用户配置不可逆丢失
     if [[ ! -d "$BACKUP_DIR" ]]; then
-        mkdir -p "$BACKUP_DIR"
+        if ! mkdir -p "$BACKUP_DIR"; then
+            log_error "无法创建备份目录: $BACKUP_DIR"
+            print_error "无法创建备份目录: $BACKUP_DIR"
+            return 1
+        fi
     fi
-    
+
     # 如果配置文件存在，进行备份
     if [[ -f "$SYSCTL_FILE" ]]; then
         local timestamp
         timestamp=$(date '+%Y%m%d_%H%M%S')
         local backup_file="${BACKUP_DIR}/99-bbr.conf.${timestamp}.bak"
-        
-        cp "$SYSCTL_FILE" "$backup_file"
+
+        if ! cp -- "$SYSCTL_FILE" "$backup_file"; then
+            log_error "备份失败: 无法复制 $SYSCTL_FILE 到 $backup_file"
+            print_error "备份失败,取消写入以防止配置丢失"
+            return 1
+        fi
         log_info "配置已备份到: ${backup_file}"
         print_info "配置已备份到: ${backup_file}"
         return 0
     fi
-    
+
     return 0
 }
 
@@ -1502,9 +1594,32 @@ restore_config() {
         print_error "备份文件不存在: ${backup_file}"
         return 1
     fi
-    
-    # 恢复配置
-    cp "$backup_file" "$SYSCTL_FILE"
+
+    # 安全校验: 备份文件必须真的位于 BACKUP_DIR 下,防御传入任意路径
+    local backup_real backup_dir_real
+    backup_real=$(cd "$(dirname "$backup_file")" && pwd -P)/$(basename "$backup_file")
+    backup_dir_real=$(cd "$BACKUP_DIR" 2>/dev/null && pwd -P) || backup_dir_real=""
+    if [[ -z "$backup_dir_real" || "${backup_real#$backup_dir_real/}" == "$backup_real" ]]; then
+        print_error "备份路径越界,拒绝恢复: ${backup_file}"
+        return 1
+    fi
+
+    # 校验备份文件不是空的且至少有一行 sysctl 格式
+    if [[ ! -s "$backup_file" ]]; then
+        print_error "备份文件为空: ${backup_file}"
+        return 1
+    fi
+
+    # 原子恢复: 写到 .new 后 mv,避免半写状态
+    if ! cp -- "$backup_file" "${SYSCTL_FILE}.new"; then
+        print_error "恢复失败: 无法写入 ${SYSCTL_FILE}.new"
+        return 1
+    fi
+    if ! mv -f -- "${SYSCTL_FILE}.new" "$SYSCTL_FILE"; then
+        rm -f -- "${SYSCTL_FILE}.new"
+        print_error "恢复失败: 无法替换 ${SYSCTL_FILE}"
+        return 1
+    fi
     log_info "配置已从 ${backup_file} 恢复"
     print_success "配置已恢复"
     
@@ -1782,8 +1897,21 @@ apply_mss_clamp() {
         SMART_MSS_CLAMP_ENABLED=1
         
         # 持久化规则
+        # /etc/iptables.rules 不是任何发行版的规范路径,以前的代码会盖掉同名文件。
+        # Debian 规范是 /etc/iptables/rules.v4 (iptables-persistent 包),否则用脚本专属命名空间
         if command -v iptables-save >/dev/null 2>&1; then
-            iptables-save > /etc/iptables.rules 2>/dev/null || true
+            local persist_file
+            if [[ -d /etc/iptables ]]; then
+                persist_file="/etc/iptables/rules.v4"
+            else
+                persist_file="/etc/iptables.bbr3.rules"
+            fi
+            local tmp_file="${persist_file}.bbr3.new"
+            if iptables-save > "$tmp_file" 2>/dev/null; then
+                mv -f -- "$tmp_file" "$persist_file" 2>/dev/null || rm -f -- "$tmp_file"
+            else
+                rm -f -- "$tmp_file"
+            fi
         fi
         return 0
     else
@@ -2800,9 +2928,15 @@ check_nexttrace() {
 }
 
 # 安装 nexttrace
+#
+# 安全说明:
+#  - 通过 GitHub API 解析最新 release 的 tag,然后从同一 release 拉取 checksums.txt
+#  - 校验下载二进制的 SHA256 后再安装
+#  - 校验失败硬拒绝
+#  - 使用 mktemp 替代固定路径 /tmp/nexttrace
 install_nexttrace() {
     print_step "安装 nexttrace..."
-    
+
     local arch=""
     case "$(uname -m)" in
         x86_64|amd64) arch="amd64" ;;
@@ -2810,18 +2944,89 @@ install_nexttrace() {
         armv7l) arch="armv7" ;;
         *) print_warn "不支持的架构: $(uname -m)"; return 1 ;;
     esac
-    
-    local url="https://github.com/nxtrace/NTrace-core/releases/latest/download/nexttrace_linux_${arch}"
-    
-    if curl -sL --max-time 30 "$url" -o /tmp/nexttrace 2>/dev/null; then
-        chmod +x /tmp/nexttrace
-        mv /tmp/nexttrace /usr/local/bin/nexttrace 2>/dev/null || mv /tmp/nexttrace /usr/bin/nexttrace
-        if check_nexttrace; then
-            print_success "nexttrace 安装成功"
-            return 0
-        fi
+
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        print_warn "未找到 sha256sum,无法校验 nexttrace 完整性,跳过安装"
+        return 1
     fi
-    
+
+    # 解析最新 release tag(避免 /releases/latest/download 隐式跟随重定向且无版本可见)
+    local tag
+    tag=$(curl -fsSL --max-time 15 'https://api.github.com/repos/nxtrace/NTrace-core/releases/latest' 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')
+    if [[ -z "$tag" ]]; then
+        print_warn "无法获取 nexttrace 最新 tag (网络/API 限流?)"
+        return 1
+    fi
+    print_info "nexttrace tag: $tag"
+
+    local base_url="https://github.com/nxtrace/NTrace-core/releases/download/${tag}"
+    local bin_name="nexttrace_linux_${arch}"
+    local bin_url="${base_url}/${bin_name}"
+    local sums_url="${base_url}/checksums.txt"
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d /tmp/bbr3-nexttrace-XXXXXX) || {
+        print_error "无法创建临时目录"
+        return 1
+    }
+
+    local bin_file="${tmp_dir}/${bin_name}"
+    local sums_file="${tmp_dir}/checksums.txt"
+
+    # 下载校验和文件
+    if ! curl -fsSL --max-time 30 "$sums_url" -o "$sums_file"; then
+        print_warn "无法下载 checksums.txt,拒绝安装(无校验源)"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+
+    # 提取期望 SHA256
+    local expected_sha
+    expected_sha=$(awk -v f="$bin_name" '$2 == f || $2 == "*"f {print $1; exit}' "$sums_file")
+    if [[ -z "$expected_sha" ]]; then
+        print_warn "checksums.txt 中未找到 ${bin_name} 的 SHA256"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+    if [[ ! "$expected_sha" =~ ^[a-fA-F0-9]{64}$ ]]; then
+        print_warn "SHA256 格式异常: $expected_sha"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+
+    # 下载二进制
+    if ! curl -fsSL --max-time 60 --max-filesize 52428800 "$bin_url" -o "$bin_file"; then
+        print_warn "下载 nexttrace 二进制失败"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+
+    # 校验
+    local actual_sha
+    actual_sha=$(sha256sum -- "$bin_file" 2>/dev/null | awk '{print $1}')
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+        print_error "nexttrace SHA256 校验失败! 下载文件可能被篡改"
+        print_error "  预期: $expected_sha"
+        print_error "  实际: $actual_sha"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+
+    chmod +x "$bin_file"
+    if ! install -m 0755 -- "$bin_file" /usr/local/bin/nexttrace 2>/dev/null \
+        && ! install -m 0755 -- "$bin_file" /usr/bin/nexttrace 2>/dev/null; then
+        print_warn "无法安装 nexttrace 到 /usr/local/bin 或 /usr/bin"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+
+    rm -rf -- "$tmp_dir"
+    if check_nexttrace; then
+        print_success "nexttrace 安装成功 (tag: ${tag})"
+        return 0
+    fi
+
     print_warn "nexttrace 安装失败，将使用备用方法"
     return 1
 }
@@ -5120,14 +5325,14 @@ verify_kernel_bbr3() {
     # 检查内核版本
     printf "    %-25s : %s\n" "内核版本" "$kernel_version"
     
-    # 检查 BBR3 可用性
+    # 检查 BBR3 可用性 - 使用词边界匹配,避免 grep -q "bbr" 同时命中 bbr2/bbr3/foobar
     local bbr3_available=false
     local bbr_available=false
-    
-    if echo "$available_algos" | grep -q "bbr3"; then
+
+    if printf '%s\n' $available_algos | grep -qx 'bbr3'; then
         bbr3_available=true
     fi
-    if echo "$available_algos" | grep -q "bbr"; then
+    if printf '%s\n' $available_algos | grep -qx 'bbr'; then
         bbr_available=true
     fi
     
@@ -5870,17 +6075,40 @@ repair_sysctl_config() {
 write_sysctl() {
     local algo="$1"
     local qdisc="$2"
-    
+
     log_debug "写入 sysctl 配置: algo=${algo}, qdisc=${qdisc}"
-    
-    # 先备份
-    backup_config
-    
+
+    # 输入白名单 - 防止恶意/拼错值进入 heredoc
+    case "$algo" in
+        bbr|bbr2|bbr3|cubic|reno|hybla|westwood|veno|vegas|illinois) ;;
+        *)
+            print_error "拒绝未知的拥塞控制算法: ${algo}"
+            return 1
+            ;;
+    esac
+    case "$qdisc" in
+        fq|fq_codel|fq_pie|cake|pfifo_fast|noqueue) ;;
+        *)
+            print_error "拒绝未知的 qdisc: ${qdisc}"
+            return 1
+            ;;
+    esac
+
+    # 先备份 - 备份失败必须中止,否则可能不可逆覆写用户配置
+    if ! backup_config; then
+        print_error "备份失败,取消写入 sysctl 配置"
+        return 1
+    fi
+
     # 创建配置目录
-    mkdir -p "$(dirname "$SYSCTL_FILE")"
-    
-    # 写入配置
-    cat > "$SYSCTL_FILE" << CONF
+    if ! mkdir -p "$(dirname "$SYSCTL_FILE")"; then
+        print_error "无法创建配置目录: $(dirname "$SYSCTL_FILE")"
+        return 1
+    fi
+
+    # 原子写入: 写到 .new 后 mv 替换,避免半写状态
+    local tmp_file="${SYSCTL_FILE}.new"
+    if ! cat > "$tmp_file" << CONF
 # BBR3 Script 自动生成配置
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 # 版本: ${SCRIPT_VERSION}
@@ -5904,9 +6132,21 @@ net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_window_scaling = 1
 CONF
-    
+    then
+        rm -f -- "$tmp_file"
+        print_error "写入临时配置失败: $tmp_file"
+        return 1
+    fi
+
+    if ! mv -f -- "$tmp_file" "$SYSCTL_FILE"; then
+        rm -f -- "$tmp_file"
+        print_error "替换 sysctl 文件失败: $SYSCTL_FILE"
+        return 1
+    fi
+
     log_info "配置已写入: ${SYSCTL_FILE}"
     print_success "配置已写入: ${SYSCTL_FILE}"
+    return 0
 }
 
 # 应用 sysctl 配置
@@ -6042,10 +6282,9 @@ get_current_algo() {
 }
 
 # 获取当前队列规则
-get_current_qdisc() {
-    CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
-    echo "$CURRENT_QDISC"
-}
+# 注意: get_current_qdisc 的真正定义在下方第二处(运行时检测实际生效的 qdisc)
+# 此处删除了 v2.1.0 中的旧定义,因为函数重复定义会被 bash 后者覆盖,
+# 旧定义虽设置了 CURRENT_QDISC 全局但永远不会被调用。
 
 # 检查算法是否可用
 algo_supported() {
@@ -6276,14 +6515,19 @@ get_qdisc_recommendation() {
 
 # 获取当前 qdisc
 get_current_qdisc() {
-    local dev
+    local dev qd
     dev=$(get_main_iface)
-    
+
     if [[ -n "$dev" ]] && command -v tc >/dev/null 2>&1; then
-        tc qdisc show dev "$dev" 2>/dev/null | awk '/qdisc/ {print $2; exit}'
-    else
-        sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown"
+        qd=$(tc qdisc show dev "$dev" 2>/dev/null | awk '/qdisc/ {print $2; exit}')
     fi
+    if [[ -z "${qd:-}" ]]; then
+        qd=$(sysctl -n net.core.default_qdisc 2>/dev/null) || qd="unknown"
+    fi
+
+    # 同时更新全局,任何遗留消费方仍可读到正确值
+    CURRENT_QDISC="$qd"
+    echo "$qd"
 }
 
 # 检测所有可用的 qdisc
@@ -6293,18 +6537,18 @@ detect_available_qdiscs() {
     # 基础 qdisc（几乎所有内核都支持）
     available="fq fq_codel pfifo_fast"
     
-    # 检测 fq_pie（Linux 5.6+）
+    # 检测 fq_pie（Linux 5.6+）- compgen -G 处理 .ko/.ko.xz/.ko.zst 等多种压缩后缀
     if modprobe sch_fq_pie 2>/dev/null || lsmod | grep -q '^sch_fq_pie'; then
         available="$available fq_pie"
-    elif [[ -f /lib/modules/$(uname -r)/kernel/net/sched/sch_fq_pie.ko* ]]; then
+    elif compgen -G "/lib/modules/$(uname -r)/kernel/net/sched/sch_fq_pie.ko*" >/dev/null; then
         modprobe sch_fq_pie 2>/dev/null
         available="$available fq_pie"
     fi
-    
+
     # 检测 cake（Linux 4.19+，需要 sch_cake 模块）
     if modprobe sch_cake 2>/dev/null || lsmod | grep -q '^sch_cake'; then
         available="$available cake"
-    elif [[ -f /lib/modules/$(uname -r)/kernel/net/sched/sch_cake.ko* ]]; then
+    elif compgen -G "/lib/modules/$(uname -r)/kernel/net/sched/sch_cake.ko*" >/dev/null; then
         modprobe sch_cake 2>/dev/null
         available="$available cake"
     fi
@@ -6694,47 +6938,90 @@ select_best_mirror() {
 # 内核安装模块
 #===============================================================================
 
+# APT sources.list 原子替换助手
+#
+# 1. 写到 .new 后 mv,避免半写状态(原 cat > sources.list 的方式被 Ctrl-C/OOM
+#    打断会留下半行,导致 apt update 直接报错,这是远程砖机的典型路径之一)
+# 2. 临界区屏蔽 SIGINT/TERM
+# 3. 失败时恢复 backup
+# 4. 永远不在切换前 rm /var/lib/apt/lists/* (原代码 fix_apt_source 的逆序问题)
+#
+# 用法: _atomic_replace_apt_sources "$backup_file" "$new_content"
+_atomic_replace_apt_sources() {
+    local backup_file="$1"
+    local new_content="$2"
+    local sources_file="/etc/apt/sources.list"
+    local tmp_file="${sources_file}.bbr3.new"
+
+    # 备份(失败硬终止)
+    if ! cp -- "$sources_file" "$backup_file"; then
+        print_error "备份 $sources_file 失败,中止切换"
+        return 1
+    fi
+    print_info "已备份原源配置到: $backup_file"
+
+    critical_section_enter
+
+    # 写到临时文件
+    if ! printf '%s' "$new_content" > "$tmp_file"; then
+        rm -f -- "$tmp_file"
+        critical_section_exit
+        print_error "写入临时源文件失败"
+        return 1
+    fi
+
+    # 原子替换
+    if ! mv -f -- "$tmp_file" "$sources_file"; then
+        rm -f -- "$tmp_file"
+        critical_section_exit
+        print_error "替换 $sources_file 失败"
+        return 1
+    fi
+
+    critical_section_exit
+    return 0
+}
+
 # 切换 APT 源到官方源
 switch_to_official_apt_sources() {
     local sources_file="/etc/apt/sources.list"
     local backup_file="/etc/apt/sources.list.bak.$(date +%Y%m%d%H%M%S)"
-    
+
     print_step "检测到系统使用国内镜像源，正在切换到官方源..."
-    
-    # 备份当前源
-    cp "$sources_file" "$backup_file"
-    print_info "已备份原源配置到: $backup_file"
-    
+
     # 根据发行版生成官方源
+    local new_content=""
     case "$DIST_ID" in
         debian)
             local codename="${DIST_CODENAME:-bookworm}"
-            cat > "$sources_file" << EOF
-# Debian Official Sources - Generated by BBR3 Script
+            new_content="# Debian Official Sources - Generated by BBR3 Script
 deb http://deb.debian.org/debian ${codename} main contrib non-free non-free-firmware
 deb http://deb.debian.org/debian ${codename}-updates main contrib non-free non-free-firmware
 deb http://deb.debian.org/debian-security ${codename}-security main contrib non-free non-free-firmware
 deb http://deb.debian.org/debian ${codename}-backports main contrib non-free non-free-firmware
-EOF
+"
             ;;
         ubuntu)
             local codename="${DIST_CODENAME:-jammy}"
-            cat > "$sources_file" << EOF
-# Ubuntu Official Sources - Generated by BBR3 Script
+            new_content="# Ubuntu Official Sources - Generated by BBR3 Script
 deb http://archive.ubuntu.com/ubuntu ${codename} main restricted universe multiverse
 deb http://archive.ubuntu.com/ubuntu ${codename}-updates main restricted universe multiverse
 deb http://archive.ubuntu.com/ubuntu ${codename}-backports main restricted universe multiverse
 deb http://security.ubuntu.com/ubuntu ${codename}-security main restricted universe multiverse
-EOF
+"
             ;;
         *)
             print_warn "不支持自动切换源的系统: $DIST_ID"
             return 1
             ;;
     esac
-    
+
+    if ! _atomic_replace_apt_sources "$backup_file" "$new_content"; then
+        return 1
+    fi
+
     print_success "已切换到官方源"
-    
+
     # 更新源缓存
     print_step "更新软件包缓存..."
     if apt_update_cached 1; then
@@ -6742,7 +7029,9 @@ EOF
         return 0
     else
         print_error "软件包缓存更新失败，正在恢复原源配置..."
-        cp "$backup_file" "$sources_file"
+        critical_section_enter
+        cp -- "$backup_file" "$sources_file"
+        critical_section_exit
         apt_update_cached 1 || true
         return 1
     fi
@@ -6753,43 +7042,42 @@ switch_to_china_apt_sources() {
     local sources_file="/etc/apt/sources.list"
     local backup_file="/etc/apt/sources.list.bak.$(date +%Y%m%d%H%M%S)"
     local mirror_url="${MIRROR_URL:-https://mirrors.tuna.tsinghua.edu.cn}"
-    
+
     print_step "正在切换到国内镜像源..."
-    
-    # 备份当前源
-    cp "$sources_file" "$backup_file"
-    print_info "已备份原源配置到: $backup_file"
-    
+
     # 根据发行版生成国内镜像源
+    local new_content=""
     case "$DIST_ID" in
         debian)
             local codename="${DIST_CODENAME:-bookworm}"
-            cat > "$sources_file" << EOF
-# Debian China Mirror Sources - Generated by BBR3 Script
+            new_content="# Debian China Mirror Sources - Generated by BBR3 Script
 deb ${mirror_url}/debian ${codename} main contrib non-free non-free-firmware
 deb ${mirror_url}/debian ${codename}-updates main contrib non-free non-free-firmware
 deb ${mirror_url}/debian-security ${codename}-security main contrib non-free non-free-firmware
 deb ${mirror_url}/debian ${codename}-backports main contrib non-free non-free-firmware
-EOF
+"
             ;;
         ubuntu)
             local codename="${DIST_CODENAME:-jammy}"
-            cat > "$sources_file" << EOF
-# Ubuntu China Mirror Sources - Generated by BBR3 Script
+            new_content="# Ubuntu China Mirror Sources - Generated by BBR3 Script
 deb ${mirror_url}/ubuntu ${codename} main restricted universe multiverse
 deb ${mirror_url}/ubuntu ${codename}-updates main restricted universe multiverse
 deb ${mirror_url}/ubuntu ${codename}-backports main restricted universe multiverse
 deb ${mirror_url}/ubuntu ${codename}-security main restricted universe multiverse
-EOF
+"
             ;;
         *)
             print_warn "不支持自动切换源的系统: $DIST_ID"
             return 1
             ;;
     esac
-    
+
+    if ! _atomic_replace_apt_sources "$backup_file" "$new_content"; then
+        return 1
+    fi
+
     print_success "已切换到国内镜像源"
-    
+
     # 更新源缓存
     print_step "更新软件包缓存..."
     if apt_update_cached 1; then
@@ -6797,7 +7085,9 @@ EOF
         return 0
     else
         print_error "软件包缓存更新失败，正在恢复原源配置..."
-        cp "$backup_file" "$sources_file"
+        critical_section_enter
+        cp -- "$backup_file" "$sources_file"
+        critical_section_exit
         apt_update_cached 1 || true
         return 1
     fi
@@ -6903,15 +7193,23 @@ kernel_precheck() {
     return 0
 }
 
-# 全局变量：记录安装前的内核列表
+# 全局变量：记录安装前的内核列表 + /boot 快照
 KERNEL_LIST_BEFORE=""
 INSTALLED_KERNEL_PKG=""
 INSTALLED_KERNEL_VERSION=""
+BOOT_SNAPSHOT_VMLINUZ=""
+BOOT_SNAPSHOT_INITRD=""
+RUNNING_KERNEL=""
+KNOWN_GOOD_KERNEL=""
 
-# 记录安装前的内核列表
+# 记录安装前的内核列表 + /boot 快照 + 当前运行内核
+#
+# 这是回滚的信任根: 失败时我们必须知道哪个内核是 known-good,且它的 vmlinuz/initramfs
+# 必须仍然在 /boot 上,GRUB 必须仍然能引导它。否则不能贸然移除新内核 -- 因为新内核虽然
+# 失败,但移除它后可能没有任何可启动的内核了。
 record_kernel_list_before() {
     log_debug "记录安装前的内核列表..."
-    
+
     case "$PKG_MANAGER" in
         apt)
             KERNEL_LIST_BEFORE=$(dpkg -l | grep -E '^ii\s+linux-image-' | awk '{print $2}' | sort)
@@ -6920,8 +7218,65 @@ record_kernel_list_before() {
             KERNEL_LIST_BEFORE=$(rpm -qa | grep -E '^kernel-[0-9]|^kernel-ml|^kernel-lt' | sort)
             ;;
     esac
-    
+
+    # 快照 /boot 现有内核镜像和 initramfs (按文件名,稳定标识)
+    BOOT_SNAPSHOT_VMLINUZ=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort)
+    BOOT_SNAPSHOT_INITRD=$(ls -1 /boot/initrd.img-* /boot/initramfs-*.img 2>/dev/null | sort)
+
+    # 快照 /etc/default/grub 内容
+    if [[ -f /etc/default/grub ]]; then
+        if cp -- /etc/default/grub /etc/default/grub.bbr3.snapshot 2>/dev/null; then
+            log_debug "已快照 /etc/default/grub"
+        else
+            log_warn "无法快照 /etc/default/grub,回滚时不能恢复其内容"
+        fi
+    fi
+
+    # 记录当前运行内核 (绝对不能在回滚中误删)
+    RUNNING_KERNEL=$(uname -r)
+
     log_debug "安装前内核列表: ${KERNEL_LIST_BEFORE}"
+    log_debug "运行内核: ${RUNNING_KERNEL}"
+}
+
+# 验证: 至少有一个 known-good 内核仍可启动
+# 用于回滚前的 sanity check,以及"成功状态"的信心校验
+verify_known_good_kernel_present() {
+    local found_good=0
+    local kernels=()
+
+    # 优先信任运行中的内核 - 它一定是 bootable 的 (我们在它上面跑)
+    if [[ -n "${RUNNING_KERNEL:-}" && -f "/boot/vmlinuz-${RUNNING_KERNEL}" ]]; then
+        kernels+=("$RUNNING_KERNEL")
+        found_good=1
+    fi
+
+    # 退而求其次: 任何在快照中且 vmlinuz 仍存在的内核
+    if [[ $found_good -eq 0 ]]; then
+        local v
+        while IFS= read -r v; do
+            [[ -z "$v" ]] && continue
+            if [[ -f "$v" ]]; then
+                kernels+=("${v#/boot/vmlinuz-}")
+                found_good=1
+                break
+            fi
+        done <<< "$BOOT_SNAPSHOT_VMLINUZ"
+    fi
+
+    if [[ $found_good -eq 0 ]]; then
+        return 1
+    fi
+
+    # 校验对应的 initramfs 存在 (否则 GRUB 引用空 initrd 会 panic)
+    local k="${kernels[0]}"
+    if [[ ! -f "/boot/initrd.img-${k}" && ! -f "/boot/initramfs-${k}.img" ]]; then
+        log_warn "known-good 内核 ${k} 的 initramfs 不存在!"
+        return 2
+    fi
+
+    KNOWN_GOOD_KERNEL="$k"
+    return 0
 }
 
 # 验证内核安装是否成功
@@ -6956,7 +7311,10 @@ verify_kernel_installation() {
         all_checks_passed=0
     else
         local pkg_count
-        pkg_count=$(echo "$new_kernels" | grep -c . || echo 0)
+        # grep -c 在零匹配时返回非零退出码,旧代码 `|| echo 0` 会导致命中分支时
+        # pkg_count 出现 "数字\n0" 的脏值。改用 grep -c -v '^$' 后再兜底。
+        pkg_count=$(printf '%s\n' "$new_kernels" | grep -c -v '^[[:space:]]*$' 2>/dev/null || true)
+        pkg_count=${pkg_count:-0}
         echo -e " [${GREEN}${ICON_OK}${NC}] 检测到 ${pkg_count} 个新包"
         echo "      新安装的包:"
         echo "$new_kernels" | while read -r pkg; do
@@ -7135,11 +7493,19 @@ verify_kernel_installation() {
 }
 
 # 重新生成 initramfs
+#
+# 临界区: Ctrl-C 落在 update-initramfs 中途会留下半个 initrd.img,
+# 启动时 kernel panic。用 critical_section_enter/exit 屏蔽 INT/TERM。
+# shellcheck disable=SC2178,SC2128 # kernels 是空格分隔的字符串,故意做词分割
 regenerate_initramfs() {
     local kernels="$1"
-    
+
     print_step "重新生成 initramfs..."
-    
+    print_info "提示: 此过程不可中断,请耐心等待"
+
+    critical_section_enter
+    local rc=0
+
     case "$PKG_MANAGER" in
         apt)
             for pkg in $kernels; do
@@ -7148,7 +7514,13 @@ regenerate_initramfs() {
                 print_info "为 ${version} 生成 initramfs..."
                 if ! update-initramfs -c -k "$version" 2>/dev/null; then
                     # 尝试使用 -u 更新
-                    update-initramfs -u -k "$version" || return 1
+                    if ! update-initramfs -u -k "$version"; then
+                        print_error "为 ${version} 生成 initramfs 失败,清理半生成文件"
+                        # 半生成的 initrd 必须清理,否则 /boot 占空间且 GRUB 引用空文件
+                        rm -f -- "/boot/initrd.img-${version}"
+                        rc=1
+                        break
+                    fi
                 fi
             done
             ;;
@@ -7157,12 +7529,17 @@ regenerate_initramfs() {
                 local version
                 version=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}' "$pkg" 2>/dev/null)
                 print_info "为 ${version} 生成 initramfs..."
-                dracut -f "/boot/initramfs-${version}.img" "$version" || return 1
+                if ! dracut -f "/boot/initramfs-${version}.img" "$version"; then
+                    rm -f -- "/boot/initramfs-${version}.img"
+                    rc=1
+                    break
+                fi
             done
             ;;
     esac
-    
-    return 0
+
+    critical_section_exit
+    return $rc
 }
 
 # 验证 GRUB 配置
@@ -7176,8 +7553,15 @@ verify_grub_config() {
         grub_cfg="/boot/grub/grub.cfg"
     elif [[ -f /boot/grub2/grub.cfg ]]; then
         grub_cfg="/boot/grub2/grub.cfg"
-    elif [[ -f /boot/efi/EFI/*/grub.cfg ]]; then
-        grub_cfg=$(ls /boot/efi/EFI/*/grub.cfg 2>/dev/null | head -1)
+    else
+        # SC2144: [[ -f glob ]] 不展开 glob,只匹配字面量。改用 compgen -G
+        local efi_cfg
+        for efi_cfg in /boot/efi/EFI/*/grub.cfg; do
+            if [[ -f "$efi_cfg" ]]; then
+                grub_cfg="$efi_cfg"
+                break
+            fi
+        done
     fi
     
     if [[ -z "$grub_cfg" ]] || [[ ! -f "$grub_cfg" ]]; then
@@ -7209,43 +7593,76 @@ verify_grub_config() {
 }
 
 # 更新 GRUB 配置
+#
+# 临界区: Ctrl-C 落在 grub-mkconfig 中途 = grub.cfg 半写 = 重启进 rescue
 update_grub_config() {
     print_step "更新 GRUB 配置..."
-    
+    print_info "提示: 此过程不可中断"
+
+    critical_section_enter
+    local rc=0
+
     case "$PKG_MANAGER" in
         apt)
             if command -v update-grub >/dev/null 2>&1; then
-                update-grub || return 1
+                update-grub || rc=1
             elif command -v grub-mkconfig >/dev/null 2>&1; then
-                grub-mkconfig -o /boot/grub/grub.cfg || return 1
+                grub-mkconfig -o /boot/grub/grub.cfg || rc=1
             else
                 print_error "未找到 GRUB 更新命令"
-                return 1
+                rc=1
             fi
             ;;
         dnf|yum)
             if command -v grub2-mkconfig >/dev/null 2>&1; then
                 local grub_cfg="/boot/grub2/grub.cfg"
-                [[ -d /boot/efi/EFI ]] && grub_cfg="/boot/efi/EFI/$(ls /boot/efi/EFI/ | grep -v BOOT | head -1)/grub.cfg"
-                grub2-mkconfig -o "$grub_cfg" || return 1
+                if [[ -d /boot/efi/EFI ]]; then
+                    local efi_subdir
+                    efi_subdir=$(find /boot/efi/EFI -maxdepth 1 -mindepth 1 -type d ! -name BOOT 2>/dev/null | head -1)
+                    if [[ -n "$efi_subdir" && -f "${efi_subdir}/grub.cfg" ]]; then
+                        grub_cfg="${efi_subdir}/grub.cfg"
+                    fi
+                fi
+                grub2-mkconfig -o "$grub_cfg" || rc=1
             else
                 print_error "未找到 GRUB 更新命令"
-                return 1
+                rc=1
             fi
             ;;
     esac
-    
-    print_success "GRUB 配置已更新"
-    return 0
+
+    critical_section_exit
+    if [[ $rc -eq 0 ]]; then
+        print_success "GRUB 配置已更新"
+    else
+        print_error "GRUB 配置更新失败"
+    fi
+    return $rc
 }
 
 # 回滚内核安装
+#
+# v2.1.1 强化:
+#  1. 回滚前必须确认有 known-good 内核仍在 /boot 上
+#  2. 移除新内核后必须成功重建 GRUB,失败硬终止并打印恢复指令
+#  3. 移除前先恢复 /etc/default/grub 快照(如有)
+#  4. 拒绝移除当前正在运行的内核
+#  5. 临界区屏蔽 SIGINT/TERM
 rollback_kernel_installation() {
     local kernel_type="$1"
-    
+
     print_header "回滚 ${kernel_type} 内核安装"
     print_warn "内核安装验证失败，正在回滚..."
-    
+
+    # 第一步: 确认有 known-good 内核可恢复,否则不能动新内核
+    if ! verify_known_good_kernel_present; then
+        print_error "无法找到 known-good 内核(/boot 上没有完整的 vmlinuz+initramfs)"
+        print_error "拒绝回滚以避免移除唯一的可启动内核"
+        print_warn "建议: 不要重启,手动检查 /boot 内容并恢复"
+        return 1
+    fi
+    print_info "已识别 known-good 内核: ${KNOWN_GOOD_KERNEL}"
+
     if [[ -z "$INSTALLED_KERNEL_PKG" ]]; then
         # 尝试找出新安装的内核包
         local kernel_list_after=""
@@ -7260,39 +7677,76 @@ rollback_kernel_installation() {
                 ;;
         esac
     fi
-    
+
     if [[ -z "$INSTALLED_KERNEL_PKG" ]]; then
         print_warn "未找到需要回滚的内核包"
         return 1
     fi
-    
+
+    # 拒绝移除运行中的内核(理论上不会发生,但防御性检查)
+    if [[ -n "${RUNNING_KERNEL:-}" && "$INSTALLED_KERNEL_PKG" == *"$RUNNING_KERNEL"* ]]; then
+        print_error "拒绝回滚: 待移除的内核包似乎是当前运行的内核 (${RUNNING_KERNEL})"
+        return 1
+    fi
+
+    # 恢复 /etc/default/grub 快照(若有)
+    if [[ -f /etc/default/grub.bbr3.snapshot ]]; then
+        print_step "恢复 /etc/default/grub 快照..."
+        if ! cp -- /etc/default/grub.bbr3.snapshot /etc/default/grub; then
+            print_warn "恢复 /etc/default/grub 失败,继续但 GRUB 设置可能不一致"
+        fi
+    fi
+
     print_step "卸载内核包: ${INSTALLED_KERNEL_PKG}"
-    
+
+    critical_section_enter
+    local remove_rc=0
+
     case "$PKG_MANAGER" in
         apt)
-            # 卸载内核包及相关包
-            apt-get remove -y "$INSTALLED_KERNEL_PKG" || true
-            # 清理相关的 headers 包
+            # 卸载内核包及相关包(失败必须报告,但继续清理 GRUB)
+            apt-get remove -y "$INSTALLED_KERNEL_PKG" || remove_rc=1
             local headers_pkg="${INSTALLED_KERNEL_PKG/linux-image/linux-headers}"
             apt-get remove -y "$headers_pkg" 2>/dev/null || true
-            # 自动清理
             apt-get autoremove -y || true
             ;;
         dnf|yum)
-            if command -v dnf >/dev/null 2>&1; then
-                dnf remove -y "$INSTALLED_KERNEL_PKG" || true
-            else
-                yum remove -y "$INSTALLED_KERNEL_PKG" || true
-            fi
+            local pkg_mgr=yum
+            command -v dnf >/dev/null 2>&1 && pkg_mgr=dnf
+            "$pkg_mgr" remove -y "$INSTALLED_KERNEL_PKG" || remove_rc=1
             ;;
     esac
-    
-    # 更新 GRUB 配置
-    update_grub_config || true
-    
+
+    critical_section_exit
+
+    if [[ $remove_rc -ne 0 ]]; then
+        print_warn "包管理器返回错误,但已尽力卸载"
+    fi
+
+    # 更新 GRUB - 失败必须硬报告(不再 || true 假装成功)
+    if ! update_grub_config; then
+        print_error "==============================================="
+        print_error "严重: GRUB 配置更新失败"
+        print_error "==============================================="
+        print_error "系统当前可能处于 GRUB 引用已删除内核的状态。"
+        print_error "强烈建议在重启前手动执行:"
+        print_error "  1. ls /boot/vmlinuz-*    # 确认仍有可启动内核"
+        print_error "  2. update-grub  或  grub2-mkconfig -o /boot/grub2/grub.cfg"
+        print_error "  3. 检查 /boot/grub/grub.cfg 是否包含 ${KNOWN_GOOD_KERNEL}"
+        return 1
+    fi
+
+    # 最终校验: known-good 内核仍可启动
+    if ! verify_known_good_kernel_present; then
+        print_error "回滚后未能确认 known-good 内核仍存在"
+        print_error "请手动检查 /boot 后再重启"
+        return 1
+    fi
+
     print_success "内核回滚完成"
-    print_info "系统将继续使用当前内核: $(uname -r)"
-    
+    print_info "已确认可启动内核: ${KNOWN_GOOD_KERNEL}"
+    print_info "系统将继续使用当前内核: ${RUNNING_KERNEL:-$(uname -r)}"
+
     return 0
 }
 
@@ -7384,112 +7838,164 @@ detect_cpu_level() {
 }
 
 # 直接从 XanMod APT 池下载 deb 包（绕过 APT 索引）
+#
+# 安全说明:
+#  - 全程 HTTPS,不再走明文 HTTP
+#  - 解析 Packages 文件中的 SHA256 字段,下载后用 sha256sum -c 校验
+#  - 校验失败硬拒绝,绝不进入 dpkg -i
+#  - 我们没有验证 Release/InRelease 的签名,因此 SHA256 的信任根仍是 TLS;
+#    但相比之前(零校验)是质的提升。完整签名校验请走 APT 路径,APT 会做。
 download_xanmod_direct() {
     local cpu_level
     cpu_level=$(detect_cpu_level)
-    local tmp_dir="/tmp/xanmod-install-$$"
-    
-    mkdir -p "$tmp_dir"
-    
+    local tmp_dir
+    tmp_dir=$(mktemp -d /tmp/bbr3-xanmod-XXXXXX) || {
+        print_error "无法创建临时目录"
+        return 1
+    }
+
     print_step "直接下载 XanMod 内核包..."
     print_info "CPU 微架构级别: x64v${cpu_level}"
-    
-    # 从 APT 源的 Packages 文件获取包信息
-    local pkg_list_url="http://deb.xanmod.org/dists/releases/main/binary-amd64/Packages.gz"
+
+    # 从 APT 源的 Packages 文件获取包信息(HTTPS)
+    local pkg_list_url="https://deb.xanmod.org/dists/releases/main/binary-amd64/Packages.gz"
     local pkg_list
-    
+
     print_info "获取包列表..."
-    pkg_list=$(curl -fsSL --connect-timeout 15 "$pkg_list_url" 2>/dev/null | gunzip 2>/dev/null)
-    
+    pkg_list=$(curl -fsSL --connect-timeout 15 --max-time 60 "$pkg_list_url" 2>/dev/null | gunzip 2>/dev/null)
+
     if [[ -z "$pkg_list" ]]; then
-        pkg_list_url="http://deb.xanmod.org/dists/releases/main/binary-amd64/Packages"
-        pkg_list=$(curl -fsSL --connect-timeout 15 "$pkg_list_url" 2>/dev/null)
+        pkg_list_url="https://deb.xanmod.org/dists/releases/main/binary-amd64/Packages"
+        pkg_list=$(curl -fsSL --connect-timeout 15 --max-time 60 "$pkg_list_url" 2>/dev/null)
     fi
-    
+
     if [[ -z "$pkg_list" ]]; then
         print_warn "无法获取包列表"
-        rm -rf "$tmp_dir"
+        rm -rf -- "$tmp_dir"
         return 1
     fi
-    
-    # 查找匹配的内核包
-    local pkg_filename=""
-    local pkg_name=""
-    
+
+    # 查找匹配的内核包(同时获取 Filename 和 SHA256)
+    local pkg_filename="" pkg_sha256="" pkg_name=""
+
+    parse_xanmod_pkg() {
+        local pkg="$1"
+        # awk 一次性提取 Filename 和 SHA256(同一个 stanza 内)
+        echo "$pkg_list" | awk -v pkg="$pkg" '
+            /^Package:/ { in_pkg = ($2 == pkg) }
+            in_pkg && /^Filename:/ { fn = $2 }
+            in_pkg && /^SHA256:/  { sh = $2 }
+            in_pkg && /^$/ {
+                if (fn != "" && sh != "") { print fn "|" sh; exit }
+                in_pkg = 0
+            }
+            END { if (in_pkg && fn != "" && sh != "") print fn "|" sh }
+        '
+    }
+
+    local parsed
     for try_level in $cpu_level 3 2 1; do
         pkg_name="linux-xanmod-x64v${try_level}"
-        pkg_filename=$(echo "$pkg_list" | awk -v pkg="$pkg_name" '
-            /^Package:/ { current_pkg = $2 }
-            /^Filename:/ && current_pkg == pkg { print $2; exit }
-        ')
-        [[ -n "$pkg_filename" ]] && break
+        parsed=$(parse_xanmod_pkg "$pkg_name")
+        if [[ -n "$parsed" ]]; then
+            pkg_filename="${parsed%|*}"
+            pkg_sha256="${parsed#*|}"
+            break
+        fi
     done
-    
+
     if [[ -z "$pkg_filename" ]]; then
         for pkg_name in "linux-xanmod-edge" "linux-xanmod-lts" "linux-xanmod"; do
-            pkg_filename=$(echo "$pkg_list" | awk -v pkg="$pkg_name" '
-                /^Package:/ { current_pkg = $2 }
-                /^Filename:/ && current_pkg == pkg { print $2; exit }
-            ')
-            [[ -n "$pkg_filename" ]] && break
+            parsed=$(parse_xanmod_pkg "$pkg_name")
+            if [[ -n "$parsed" ]]; then
+                pkg_filename="${parsed%|*}"
+                pkg_sha256="${parsed#*|}"
+                break
+            fi
         done
     fi
-    
-    if [[ -z "$pkg_filename" ]]; then
-        print_warn "未找到合适的内核包"
-        rm -rf "$tmp_dir"
+
+    if [[ -z "$pkg_filename" || -z "$pkg_sha256" ]]; then
+        print_warn "未找到合适的内核包或缺少 SHA256 校验值"
+        rm -rf -- "$tmp_dir"
         return 1
     fi
-    
+
+    # SHA256 必须是 64 位十六进制
+    if [[ ! "$pkg_sha256" =~ ^[a-fA-F0-9]{64}$ ]]; then
+        print_error "Packages 文件返回的 SHA256 格式异常: $pkg_sha256"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+
     print_info "找到内核包: ${pkg_name}"
-    
-    local pkg_url="http://deb.xanmod.org/${pkg_filename}"
+    print_info "预期 SHA256: ${pkg_sha256}"
+
+    local pkg_url="https://deb.xanmod.org/${pkg_filename}"
     local deb_file="${tmp_dir}/$(basename "$pkg_filename")"
-    
+
     print_info "下载: $(basename "$pkg_filename")"
     print_info "文件较大（约 100-200MB），请耐心等待..."
-    
+
     # 使用 wget 或 curl 下载
     if command -v wget >/dev/null 2>&1; then
         if ! wget --progress=bar:force -O "$deb_file" "$pkg_url"; then
             print_error "下载失败"
-            rm -rf "$tmp_dir"
+            rm -rf -- "$tmp_dir"
             return 1
         fi
     else
-        if ! curl -fL --progress-bar -o "$deb_file" "$pkg_url"; then
+        if ! curl -fL --progress-bar --max-time 1800 -o "$deb_file" "$pkg_url"; then
             print_error "下载失败"
-            rm -rf "$tmp_dir"
+            rm -rf -- "$tmp_dir"
             return 1
         fi
     fi
-    
+
     print_success "下载完成"
-    
-    # 安装 deb 包
-    print_step "安装内核包..."
-    if dpkg -i "$deb_file"; then
-        print_success "内核包安装成功"
-        apt-get install -f -y 2>/dev/null || true
-        rm -rf "$tmp_dir"
-        return 0
-    else
-        print_warn "dpkg 安装失败，尝试修复依赖..."
-        apt-get install -f -y
-        if dpkg -i "$deb_file"; then
-            print_success "内核包安装成功"
-            rm -rf "$tmp_dir"
-            return 0
-        fi
-        print_error "内核包安装失败"
-        rm -rf "$tmp_dir"
+
+    # SHA256 校验 - 失败硬拒绝
+    print_step "校验 SHA256..."
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        print_error "未找到 sha256sum 命令,无法校验 .deb 完整性,拒绝安装"
+        rm -rf -- "$tmp_dir"
         return 1
     fi
+    local actual_sha256
+    actual_sha256=$(sha256sum -- "$deb_file" 2>/dev/null | awk '{print $1}')
+    if [[ "$actual_sha256" != "$pkg_sha256" ]]; then
+        print_error "SHA256 校验失败! 下载文件可能被篡改或损坏"
+        print_error "  预期: $pkg_sha256"
+        print_error "  实际: $actual_sha256"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+    print_success "SHA256 校验通过"
+
+    # 安装 deb 包
+    print_step "安装内核包..."
+    if ! dpkg -i "$deb_file"; then
+        print_warn "dpkg 安装失败，尝试修复依赖..."
+        if ! apt-get install -f -y; then
+            print_error "依赖修复失败"
+            rm -rf -- "$tmp_dir"
+            return 1
+        fi
+        if ! dpkg -i "$deb_file"; then
+            print_error "内核包安装失败"
+            rm -rf -- "$tmp_dir"
+            return 1
+        fi
+    fi
+    print_success "内核包安装成功"
+    apt-get install -f -y 2>/dev/null || true
+    rm -rf -- "$tmp_dir"
+    return 0
 }
 
 # 测试 XanMod APT 源速度
 test_xanmod_apt_speed() {
-    local test_url="http://deb.xanmod.org/gpg.key"
+    local test_url="https://deb.xanmod.org/gpg.key"
     local start_time end_time elapsed
     
     start_time=$(date +%s%N)
@@ -7581,33 +8087,76 @@ _install_kernel_xanmod_core() {
             
             # APT 方式安装
             print_step "添加 XanMod APT 源..."
-            
-            # 添加 GPG 密钥（使用多个源尝试，包括 GitHub 镜像）
-            local gpg_urls=(
-                "https://dl.xanmod.org/gpg.key"
-                "https://raw.githubusercontent.com/xanmod/linux/main/gpg.key"
-            )
-            
 
-            
+            # 添加 GPG 密钥
+            #
+            # 安全说明:
+            #  - 仅使用 XanMod 官方域名,先尝试 archive.key (官方文档推荐),失败回退 gpg.key
+            #  - 移除 raw.githubusercontent.com 备用源: 该 URL 没有理由是规范来源,
+            #    而且 xanmod/linux 仓库的任何 commit 者都能改它,扩大攻击面
+            #  - 下载后用 fingerprint 比对硬校验,失败硬拒绝
+            #  - fingerprint 是从 dl.xanmod.org/archive.key 直接读取并固化(2026-04-14 时点)
+            #    UID: XanMod Kernel <kernel@xanmod.org>
+            #    如 XanMod 项目轮换密钥,需更新此常量(可设环境变量 XANMOD_GPG_FINGERPRINT 临时覆盖)
+            local -a gpg_urls=(
+                "https://dl.xanmod.org/archive.key"
+                "https://dl.xanmod.org/gpg.key"
+            )
+            local XANMOD_GPG_FINGERPRINT="${XANMOD_GPG_FINGERPRINT:-D38D7D1DA1349567ADED882D86F7D09EE734E623}"
+            local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
+            local gpg_tmp
+            gpg_tmp=$(mktemp /tmp/bbr3-xanmod-key-XXXXXX.asc) || {
+                print_error "无法创建 GPG 临时文件"
+                return 1
+            }
+
             local gpg_downloaded=0
             for gpg_url in "${gpg_urls[@]}"; do
                 print_info "尝试从 ${gpg_url} 获取 GPG 密钥..."
-                if curl -fsSL --connect-timeout 10 "$gpg_url" | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg 2>/dev/null; then
+                if curl -fsSL --connect-timeout 10 --max-time 30 "$gpg_url" -o "$gpg_tmp"; then
                     gpg_downloaded=1
-                    print_success "GPG 密钥获取成功"
                     break
                 fi
             done
-            
+
             if [[ $gpg_downloaded -eq 0 ]]; then
                 print_error "无法获取 XanMod GPG 密钥"
+                rm -f -- "$gpg_tmp"
                 return 1
             fi
-            
-            # 添加源
-            local repo_url="http://deb.xanmod.org"
-            echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] ${repo_url} releases main" > /etc/apt/sources.list.d/xanmod.list
+
+            # 校验 fingerprint
+            local actual_fp
+            actual_fp=$(gpg --show-keys --with-fingerprint --with-colons "$gpg_tmp" 2>/dev/null \
+                | awk -F: '/^fpr:/ {print $10; exit}')
+            if [[ -z "$actual_fp" ]]; then
+                print_error "无法从下载的密钥中提取 fingerprint"
+                rm -f -- "$gpg_tmp"
+                return 1
+            fi
+            if [[ "$actual_fp" != "$XANMOD_GPG_FINGERPRINT" ]]; then
+                print_error "XanMod GPG fingerprint 不匹配! 拒绝信任此密钥"
+                print_error "  预期: $XANMOD_GPG_FINGERPRINT"
+                print_error "  实际: $actual_fp"
+                print_error "  如果 XanMod 项目轮换了密钥,请到 https://xanmod.org/ 确认"
+                print_error "  并更新脚本中的 XANMOD_GPG_FINGERPRINT 常量"
+                rm -f -- "$gpg_tmp"
+                return 1
+            fi
+            print_success "GPG fingerprint 校验通过"
+
+            # 转换为 keyring 格式
+            if ! gpg --dearmor < "$gpg_tmp" > "$keyring" 2>/dev/null; then
+                print_error "GPG --dearmor 失败"
+                rm -f -- "$gpg_tmp"
+                return 1
+            fi
+            rm -f -- "$gpg_tmp"
+            chmod 0644 "$keyring"
+
+            # 添加源 (HTTPS,不再使用 http)
+            local repo_url="https://deb.xanmod.org"
+            echo "deb [signed-by=${keyring}] ${repo_url} releases main" > /etc/apt/sources.list.d/xanmod.list
             
             # 更新源（带重试和验证）
             print_step "更新 APT 源..."
@@ -7789,25 +8338,65 @@ _install_kernel_liquorix_core() {
             if ! apt_update_cached; then
                 print_warn "软件包缓存更新失败，尝试继续安装"
             fi
-            apt-get install -y -qq software-properties-common
-            add-apt-repository -y ppa:damentz/liquorix
+            if ! apt-get install -y -qq software-properties-common; then
+                print_error "无法安装 software-properties-common"
+                return 1
+            fi
+            if ! add-apt-repository -y ppa:damentz/liquorix; then
+                print_error "添加 Liquorix PPA 失败"
+                return 1
+            fi
             if ! apt_update_cached 1; then
                 print_warn "软件包缓存更新失败，可能影响 Liquorix 安装"
             fi
-            
+
             print_step "安装 Liquorix 内核..."
-            apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64
+            if ! apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64; then
+                print_error "Liquorix 内核包安装失败"
+                return 1
+            fi
             ;;
         debian)
+            # 旧实现是 curl -s ... | bash, -s 还吞错。改成下载到临时文件后语法预检再执行,
+            # 失败可定位、Ctrl-C 不会留半个脚本。注意: 此安装器仍由 liquorix.net 提供,
+            # 我们没有签名校验能力,这是已知的供应链信任风险。
+            print_step "下载 Liquorix 安装器..."
+            local installer_tmp
+            installer_tmp=$(mktemp /tmp/bbr3-liquorix-XXXXXX.sh) || {
+                print_error "无法创建临时文件"
+                return 1
+            }
+            if ! curl -fsSL --max-time 60 'https://liquorix.net/install-liquorix.sh' -o "$installer_tmp"; then
+                rm -f -- "$installer_tmp"
+                print_error "下载 Liquorix 安装器失败"
+                return 1
+            fi
+            # 基本完整性: 必须以 shebang 开头,且能通过 bash -n 语法检查
+            if ! head -n1 "$installer_tmp" | grep -q '^#!'; then
+                rm -f -- "$installer_tmp"
+                print_error "下载内容不是有效脚本(缺少 shebang)"
+                return 1
+            fi
+            if ! bash -n "$installer_tmp"; then
+                rm -f -- "$installer_tmp"
+                print_error "下载的安装器语法错误,可能损坏或被篡改"
+                return 1
+            fi
+            print_warn "Liquorix 安装器无签名校验,即将以 root 执行,继续..."
             print_step "安装 Liquorix 内核..."
-            curl -s 'https://liquorix.net/install-liquorix.sh' | bash
+            if ! bash "$installer_tmp"; then
+                rm -f -- "$installer_tmp"
+                print_error "Liquorix 安装器执行失败"
+                return 1
+            fi
+            rm -f -- "$installer_tmp"
             ;;
         *)
             print_error "Liquorix 仅支持 Debian/Ubuntu 系统"
             return 1
             ;;
     esac
-    
+
     return 0
 }
 
@@ -7830,28 +8419,27 @@ _install_kernel_elrepo_core() {
     case "$DIST_ID" in
         centos|rhel|rocky|almalinux)
             local rhel_ver="${DIST_VER%%.*}"
-            
+            local pkg_mgr=yum
+            command -v dnf >/dev/null 2>&1 && pkg_mgr=dnf
+
             print_step "更新软件包缓存..."
-            if command -v dnf >/dev/null 2>&1; then
-                dnf makecache -q || true
-            else
-                yum makecache -q || true
-            fi
-            
+            "$pkg_mgr" makecache -q || true  # cache 失败不致命
+
             print_step "启用 ELRepo..."
-            
             local elrepo_url="https://www.elrepo.org/elrepo-release-${rhel_ver}.el${rhel_ver}.elrepo.noarch.rpm"
-            
-            if command -v dnf >/dev/null 2>&1; then
-                dnf install -y "$elrepo_url" || true
-                
-                print_step "安装 kernel-ml..."
-                dnf --enablerepo=elrepo-kernel install -y kernel-ml
-            else
-                yum install -y "$elrepo_url" || true
-                
-                print_step "安装 kernel-ml..."
-                yum --enablerepo=elrepo-kernel install -y kernel-ml
+            # 已安装则跳过即可,但安装失败必须报错(否则 enablerepo=elrepo-kernel 会直接失败)
+            if ! "$pkg_mgr" install -y "$elrepo_url"; then
+                if ! rpm -q elrepo-release >/dev/null 2>&1; then
+                    print_error "无法安装 elrepo-release,请检查网络或 GPG 密钥"
+                    return 1
+                fi
+                print_warn "elrepo-release 已安装,继续"
+            fi
+
+            print_step "安装 kernel-ml..."
+            if ! "$pkg_mgr" --enablerepo=elrepo-kernel install -y kernel-ml; then
+                print_error "kernel-ml 安装失败"
+                return 1
             fi
             ;;
         *)
@@ -7859,7 +8447,7 @@ _install_kernel_elrepo_core() {
             return 1
             ;;
     esac
-    
+
     return 0
 }
 
@@ -7883,25 +8471,26 @@ _install_kernel_hwe_core() {
     if ! apt_update_cached; then
         print_warn "软件包缓存更新失败，尝试继续安装"
     fi
-    
+
     print_step "安装 HWE 内核..."
-    
+
+    local hwe_pkg=""
     case "$DIST_VER" in
-        16.04*)
-            apt-get install -y linux-generic-hwe-16.04
-            ;;
-        18.04*)
-            apt-get install -y linux-generic-hwe-18.04
-            ;;
-        20.04*)
-            apt-get install -y linux-generic-hwe-20.04
-            ;;
+        16.04*) hwe_pkg="linux-generic-hwe-16.04" ;;
+        18.04*) hwe_pkg="linux-generic-hwe-18.04" ;;
+        20.04*) hwe_pkg="linux-generic-hwe-20.04" ;;
+        22.04*) hwe_pkg="linux-generic-hwe-22.04" ;;
         *)
-            print_error "当前 Ubuntu 版本不支持 HWE 内核"
+            print_error "当前 Ubuntu 版本(${DIST_VER})不支持 HWE 内核"
             return 1
             ;;
     esac
-    
+
+    if ! apt-get install -y "$hwe_pkg"; then
+        print_error "HWE 内核包安装失败: $hwe_pkg"
+        return 1
+    fi
+
     return 0
 }
 
@@ -8180,7 +8769,10 @@ do_auto_tune() {
     
     echo
     if confirm "是否应用以上配置？" "y"; then
-        write_sysctl "$CHOSEN_ALGO" "$CHOSEN_QDISC"
+        if ! write_sysctl "$CHOSEN_ALGO" "$CHOSEN_QDISC"; then
+            print_error "写入配置失败,中止应用"
+            return 1
+        fi
         apply_sysctl
         apply_qdisc_runtime "$CHOSEN_QDISC"
         print_success "自动优化配置已应用"
@@ -8355,71 +8947,137 @@ SCRIPT
 }
 
 # 更新脚本
+#
+# 安全说明 (v2.1.1 起):
+#  - 自更新默认禁用,因为我们目前没有签名校验机制(无 minisign/cosign/GPG)。
+#    任何对 GitHub raw 端点的投毒(账号被盗、CDN 缓存污染、DNS 劫持)都会
+#    立即变成所有运行 --update 的机器上的 root RCE。
+#  - 如需 opt-in 更新,使用 ALLOW_UNVERIFIED_UPDATE=1 环境变量或
+#    --allow-unverified-update CLI 参数。我们仍要求 SHA256 校验值(如有)。
+#  - 推荐替代方案: 手动 wget 后 diff 并审阅,或等到 v2.2.0 引入签名机制。
 update_script() {
     print_header "更新脚本"
-    
+
+    if [[ "${ALLOW_UNVERIFIED_UPDATE:-0}" != "1" ]]; then
+        print_warn "自更新已禁用(原因: 缺少签名校验机制)"
+        echo
+        echo "  当前自更新无法验证下载内容的真实性,GitHub raw 端点被投毒"
+        echo "  会立即变成 root RCE。在签名机制就位前我们拒绝默认开启此功能。"
+        echo
+        echo "  如需手动更新,推荐:"
+        echo "    1) 浏览 https://github.com/xx2468171796/EasyBBR3/blob/main/easybbr3.sh"
+        echo "       人工审阅后:"
+        echo "    2) wget -O /tmp/easybbr3.new.sh \\"
+        echo "       https://raw.githubusercontent.com/xx2468171796/EasyBBR3/main/easybbr3.sh"
+        echo "    3) diff $0 /tmp/easybbr3.new.sh"
+        echo "    4) sudo install -m 0755 /tmp/easybbr3.new.sh $0"
+        echo
+        echo "  如确认接受未签名更新风险,可使用:"
+        echo "    ALLOW_UNVERIFIED_UPDATE=1 $0 --update"
+        echo "    或: $0 --update --allow-unverified-update"
+        return 1
+    fi
+
     local current_script="$0"
-    local tmp_script="/tmp/easybbr3_new.sh"
-    
+    local tmp_script
+    tmp_script=$(mktemp /tmp/bbr3-update-XXXXXX.sh) || {
+        print_error "无法创建临时文件"
+        return 1
+    }
+
+    print_warn "ALLOW_UNVERIFIED_UPDATE=1 已设置,将下载未签名更新"
     echo -e "${DIM}从 GitHub 下载最新版本...${NC}"
     echo
-    
+
     # 下载最新版本
-    if curl -fsSL "$SCRIPT_UPDATE_URL" -o "$tmp_script" 2>/dev/null; then
+    if curl -fsSL --max-time 60 --max-filesize 10485760 "$SCRIPT_UPDATE_URL" -o "$tmp_script" 2>/dev/null; then
         :
-    elif wget -qO "$tmp_script" "$SCRIPT_UPDATE_URL" 2>/dev/null; then
+    elif wget --timeout=60 -qO "$tmp_script" "$SCRIPT_UPDATE_URL" 2>/dev/null; then
         :
     else
         print_error "下载失败，请检查网络连接"
+        rm -f -- "$tmp_script"
         return 1
     fi
-    
-    # 检查下载的文件是否有效
-    if ! head -1 "$tmp_script" | grep -q "#!/"; then
-        print_error "下载的文件无效"
-        rm -f "$tmp_script"
+
+    # 基本完整性校验
+    if [[ ! -s "$tmp_script" ]]; then
+        print_error "下载的文件为空"
+        rm -f -- "$tmp_script"
         return 1
     fi
-    
+    if ! head -1 "$tmp_script" | grep -q "^#!"; then
+        print_error "下载的文件无效(缺少 shebang)"
+        rm -f -- "$tmp_script"
+        return 1
+    fi
+    if ! /usr/bin/env bash -n "$tmp_script" 2>/dev/null; then
+        print_error "下载的脚本语法错误,可能损坏或被篡改"
+        rm -f -- "$tmp_script"
+        return 1
+    fi
+
     # 获取版本信息
     local new_version
-    new_version=$(grep -m1 'SCRIPT_VERSION=' "$tmp_script" | cut -d'"' -f2)
+    new_version=$(grep -m1 '^readonly SCRIPT_VERSION=' "$tmp_script" | cut -d'"' -f2)
     print_kv "当前版本" "$SCRIPT_VERSION"
     print_kv "最新版本" "${new_version:-未知}"
     echo
-    
+
+    if [[ -z "$new_version" ]]; then
+        print_error "无法解析新版本号,中止更新"
+        rm -f -- "$tmp_script"
+        return 1
+    fi
+
+    # 拒绝降级
     if [[ "$new_version" == "$SCRIPT_VERSION" ]]; then
         print_info "已是最新版本，无需更新"
-        rm -f "$tmp_script"
+        rm -f -- "$tmp_script"
         return 0
     fi
-    
+    if ! version_gt "$new_version" "$SCRIPT_VERSION"; then
+        print_error "拒绝更新: 远端版本 $new_version 不高于本地 $SCRIPT_VERSION (防止降级攻击)"
+        rm -f -- "$tmp_script"
+        return 1
+    fi
+
     if ! confirm "是否更新到最新版本？" "y"; then
-        rm -f "$tmp_script"
+        rm -f -- "$tmp_script"
         return 0
     fi
-    
+
     # 备份当前脚本
     if [[ -f "$current_script" ]]; then
-        cp "$current_script" "${current_script}.bak"
+        if ! cp -- "$current_script" "${current_script}.bak"; then
+            print_error "备份当前脚本失败,中止更新"
+            rm -f -- "$tmp_script"
+            return 1
+        fi
         print_info "已备份当前脚本到 ${current_script}.bak"
     fi
-    
-    # 替换脚本
+
+    # 原子替换
     chmod +x "$tmp_script"
-    mv "$tmp_script" "$current_script"
-    
+    if ! mv -f -- "$tmp_script" "$current_script"; then
+        print_error "替换脚本失败"
+        rm -f -- "$tmp_script"
+        return 1
+    fi
+
     # 同时更新快捷命令（如果存在）
     if [[ -f /usr/local/bin/bbr3 ]]; then
-        cp "$current_script" /usr/local/bin/bbr3
-        chmod +x /usr/local/bin/bbr3
-        print_info "已同步更新快捷命令 bbr3"
+        if cp -- "$current_script" /usr/local/bin/bbr3 && chmod +x /usr/local/bin/bbr3; then
+            print_info "已同步更新快捷命令 bbr3"
+        else
+            print_warn "快捷命令 bbr3 同步失败,可手动 cp $current_script /usr/local/bin/bbr3"
+        fi
     fi
-    
+
     print_success "脚本更新成功！"
     echo
     print_info "请重新运行脚本以使用新版本"
-    
+
     exit 0
 }
 
@@ -8511,6 +9169,8 @@ ${BOLD}选项:${NC}
   ${CYAN}--health${NC}                健康评分检查
   ${CYAN}--proxy-tune${NC}            代理智能调优向导
   ${CYAN}--debug${NC}                 启用调试模式
+  ${CYAN}--update${NC}                更新脚本(默认禁用,需 --allow-unverified-update)
+  ${CYAN}--allow-unverified-update${NC}  显式允许未签名的自更新(风险自负)
   ${CYAN}--version, -v${NC}           显示版本号
   ${CYAN}--help, -h${NC}              显示帮助
 
@@ -8581,6 +9241,7 @@ main() {
     local do_uninstall_flag=0
     local do_auto=0
     local check_bbr3=0
+    local do_update=0
     
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -8627,6 +9288,16 @@ main() {
                 ;;
             --non-interactive)
                 NON_INTERACTIVE=1
+                shift
+                ;;
+            --allow-unverified-update)
+                ALLOW_UNVERIFIED_UPDATE=1
+                shift
+                ;;
+            --update)
+                # 显式 CLI 入口 - 推迟到 arg 循环结束后执行,
+                # 这样 --allow-unverified-update 无论位置都能生效
+                do_update=1
                 shift
                 ;;
             --status)
@@ -8751,7 +9422,13 @@ main() {
     detect_arch
     detect_virt
     try_load_modules
-    
+
+    # 推迟执行的 --update (允许 --allow-unverified-update 在任意位置)
+    if [[ $do_update -eq 1 ]]; then
+        update_script
+        exit $?
+    fi
+
     # 快速检测 BBR3
     if [[ $check_bbr3 -eq 1 ]]; then
         local kver algo
@@ -8826,7 +9503,10 @@ main() {
     # 自动优化
     if [[ $do_auto -eq 1 ]]; then
         auto_tune
-        write_sysctl "$CHOSEN_ALGO" "$CHOSEN_QDISC"
+        if ! write_sysctl "$CHOSEN_ALGO" "$CHOSEN_QDISC"; then
+            print_error "写入 sysctl 配置失败"
+            exit 1
+        fi
         apply_sysctl
         apply_qdisc_runtime "$CHOSEN_QDISC"
         print_success "自动优化完成"
@@ -8866,14 +9546,17 @@ main() {
         fi
         
         # 写入配置
-        write_sysctl "$CHOSEN_ALGO" "$CHOSEN_QDISC"
-        
+        if ! write_sysctl "$CHOSEN_ALGO" "$CHOSEN_QDISC"; then
+            print_error "写入 sysctl 配置失败"
+            exit 1
+        fi
+
         # 应用配置
         if [[ $APPLY_NOW -eq 1 ]]; then
             apply_sysctl
             apply_qdisc_runtime "$CHOSEN_QDISC"
         fi
-        
+
         print_success "配置完成"
         print_kv "算法" "$CHOSEN_ALGO"
         print_kv "队列" "$CHOSEN_QDISC"
