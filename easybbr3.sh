@@ -7,14 +7,14 @@
 #                wget -qO- https://raw.githubusercontent.com/xx2468171796/EasyBBR3/main/easybbr3.sh | sudo bash
 #
 #   DESCRIPTION: BBR3 一键安装脚本 - 支持 BBR/BBR2/BBR3 TCP 拥塞控制
-#                支持 Debian 10-13, Ubuntu 16.04-24.04, RHEL/CentOS 7-9
+#                支持 Debian 10-13(Trixie), Ubuntu 16.04-26.04, RHEL/CentOS 7-10
 #
 #       OPTIONS: --help 查看完整帮助
 #  REQUIREMENTS: root 权限, bash 4.0+
 #        AUTHOR: 孤独制作
 #       VERSION: 2.0.1
 #       CREATED: 2024
-#      REVISION: 2024-11-29
+#      REVISION: 2026-05-19
 #       LICENSE: MIT
 #      TELEGRAM: https://t.me/+RZMe7fnvvUg1OWJl
 #        GITHUB: https://github.com/xx2468171796
@@ -45,7 +45,7 @@ fi
 #===============================================================================
 # 版本信息
 #===============================================================================
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 readonly GITHUB_URL="https://github.com/xx2468171796"
@@ -99,6 +99,7 @@ readonly SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
 readonly BACKUP_DIR="/etc/sysctl.d/bbr-backups"
 readonly LOG_FILE="/var/log/bbr3-script.log"
 readonly LOG_MAX_SIZE=1048576  # 1MB
+readonly KERNEL_PENDING_FILE="/var/lib/easybbr3/kernel-pending"
 readonly SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/xx2468171796/EasyBBR3/main/easybbr3.sh"
 
 #===============================================================================
@@ -192,7 +193,7 @@ declare -A MIRRORS_CN=(
 # 支持的系统版本
 #===============================================================================
 readonly SUPPORTED_DEBIAN="10 11 12 13"
-readonly SUPPORTED_UBUNTU="16.04 18.04 20.04 22.04 24.04"
+readonly SUPPORTED_UBUNTU="16.04 18.04 20.04 22.04 24.04 26.04"
 readonly SUPPORTED_RHEL="7 8 9"
 
 #===============================================================================
@@ -575,11 +576,9 @@ version_ge() {
     local ver_a="$1"
     local ver_b="$2"
     
-    # 提取纯版本号部分（去除后缀如 -xanmod1）
-    ver_a="${ver_a%%[-+]*}"
-    ver_b="${ver_b%%[-+]*}"
-    
-    # 使用 sort -V 进行版本比较
+    # 不剥离后缀：调用方需传入已清理的纯数字版本号
+    # （注意：sort -V 会把 6.9.0-rc1 排在 6.9.0 之前，
+    #  因此带 rc/-/+ 后缀的版本不应直接传入此函数）
     [[ "$(printf '%s\n%s\n' "$ver_b" "$ver_a" | sort -V | head -n1)" == "$ver_b" ]]
 }
 
@@ -618,7 +617,7 @@ detect_os() {
         else
             DIST_ID="rhel"
         fi
-        DIST_VER=$(grep -oE '[0-9]+\.[0-9]+' /etc/redhat-release | head -1)
+        DIST_VER=$(grep -oE '[0-9]+(\.[0-9]+)?' /etc/redhat-release | head -1)
         DIST_VER="${DIST_VER%%.*}"
     elif [[ -f /etc/debian_version ]]; then
         DIST_ID="debian"
@@ -749,7 +748,7 @@ is_supported_ubuntu() {
     [[ "$DIST_ID" == "ubuntu" ]] || return 1
     
     case "$DIST_VER" in
-        16.04*|18.04*|20.04*|22.04*|24.04*) return 0 ;;
+        16.04*|18.04*|20.04*|22.04*|24.04*|26.04*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -763,7 +762,7 @@ is_supported_rhel() {
     
     local ver="${DIST_VER%%.*}"
     case "$ver" in
-        7|8|9) return 0 ;;
+        7|8|9|10) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -953,7 +952,7 @@ precheck_disk() {
     
     # 检查 /boot 分区
     if [[ -d /boot ]]; then
-        available_mb=$(df -m /boot 2>/dev/null | awk 'NR==2 {print $4}')
+        available_mb=$(df -mP /boot 2>/dev/null | awk 'NR==2 {print $4}')
         if [[ -n "$available_mb" ]] && [[ $available_mb -lt 200 ]]; then
             PRECHECK_DISK=2
             PRECHECK_MESSAGES+=("/boot 分区空间不足 (${available_mb}MB < 200MB)，无法安装内核")
@@ -962,7 +961,7 @@ precheck_disk() {
     fi
     
     # 检查根分区
-    available_mb=$(df -m / 2>/dev/null | awk 'NR==2 {print $4}')
+    available_mb=$(df -mP / 2>/dev/null | awk 'NR==2 {print $4}')
     if [[ -n "$available_mb" ]] && [[ $available_mb -lt $min_space_mb ]]; then
         PRECHECK_DISK=2
         PRECHECK_MESSAGES+=("根分区空间不足 (${available_mb}MB < ${min_space_mb}MB)")
@@ -1004,7 +1003,7 @@ precheck_deps() {
     add_missing_dep() {
         local name="$1"
         local existing
-        for existing in "${missing_deps[@]}"; do
+        for existing in "${missing_deps[@]:-}"; do
             [[ "$existing" == "$name" ]] && return
         done
         missing_deps+=("$name")
@@ -1180,21 +1179,35 @@ fix_apt_source() {
     
     # 清理 APT 缓存
     apt-get clean
-    rm -rf /var/lib/apt/lists/*
-    
+
     # 如果是国内环境，尝试切换到国内镜像
     if [[ $USE_CHINA_MIRROR -eq 1 ]]; then
         print_info "尝试切换到国内镜像源..."
-        
-        # 检测当前系统
-        local codename="${DIST_CODENAME:-$(lsb_release -cs 2>/dev/null || echo 'stable')}"
-        
+
+        # 仅在切换镜像源时清理 lists 缓存
+        rm -rf /var/lib/apt/lists/*
+
+        # 检测当前系统代号
+        local codename="${DIST_CODENAME:-$(lsb_release -cs 2>/dev/null || true)}"
+        if [[ -z "$codename" ]]; then
+            print_error "无法解析发行版代号（codename），中止 APT 源修复"
+            return 1
+        fi
+
+        # Debian 12+ 使用 non-free-firmware 组件
+        local debian_nonfree="non-free"
+        case "$codename" in
+            bookworm|trixie|forky)
+                debian_nonfree="non-free-firmware"
+                ;;
+        esac
+
         case "$DIST_ID" in
             debian)
                 cat > /etc/apt/sources.list << EOF
-deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${codename} main contrib non-free
-deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${codename}-updates main contrib non-free
-deb https://mirrors.tuna.tsinghua.edu.cn/debian-security ${codename}-security main contrib non-free
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${codename} main contrib ${debian_nonfree}
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${codename}-updates main contrib ${debian_nonfree}
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security ${codename}-security main contrib ${debian_nonfree}
 EOF
                 ;;
             ubuntu)
@@ -1250,7 +1263,11 @@ detect_network_region() {
     fi
     
     # 判断网络环境
-    if [[ $google_ok -eq 0 ]] || { [[ $cn_latency -lt 9999 ]] && [[ $intl_latency -gt 0 ]] && [[ $cn_latency -lt $((intl_latency / 2)) ]]; }; then
+    # 仅在有正向证据时判定为国内网络：
+    #   Google 不可达 且 国内节点延迟成功且较低（< 150ms）
+    #   或国内延迟显著低于国际延迟
+    if { [[ $google_ok -eq 0 ]] && [[ $cn_latency -lt 9999 ]] && [[ $cn_latency -lt 150 ]]; } \
+        || { [[ $cn_latency -lt 9999 ]] && [[ $intl_latency -gt 0 ]] && [[ $cn_latency -lt $((intl_latency / 2)) ]]; }; then
         USE_CHINA_MIRROR=1
         MIRROR_REGION="cn"
         log_info "检测到国内网络环境，将使用国内镜像源"
@@ -1558,7 +1575,7 @@ detect_server_resources() {
     
     # 估算带宽 (通过网卡速度)
     local nic
-    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     if [[ -n "$nic" ]] && command -v ethtool >/dev/null 2>&1; then
         local speed
         speed=$(ethtool "$nic" 2>/dev/null | awk -F': ' '/Speed:/{print $2}' | grep -oE '[0-9]+')
@@ -1590,7 +1607,7 @@ detect_bandwidth() {
     
     # 方法1: 优先使用 ethtool 读取网卡速率（最快最准确）
     local nic
-    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     if [[ -n "$nic" ]] && command -v ethtool >/dev/null 2>&1; then
         local nic_speed
         # 尝试读取网卡速率，过滤掉 "Unknown" 等无效值
@@ -1633,9 +1650,9 @@ detect_bandwidth() {
         start_time=$(date +%s.%N)
         if curl -so /dev/null --max-time 30 "$test_url" 2>/dev/null; then
             end_time=$(date +%s.%N)
-            duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "30")
-            if [[ -n "$duration" ]] && (( $(echo "$duration > 0" | bc -l 2>/dev/null || echo 0) )); then
-                bandwidth=$(echo "100 * 8 / $duration" | bc 2>/dev/null || echo "0")
+            duration=$(awk "BEGIN{print ($end_time - $start_time)}" 2>/dev/null || echo "30")
+            if [[ -n "$duration" ]] && awk "BEGIN{exit !($duration > 0)}" 2>/dev/null; then
+                bandwidth=$(awk "BEGIN{printf \"%.0f\", 100*8/$duration}" 2>/dev/null || echo "0")
                 bandwidth=${bandwidth:-0}
                 log_info "curl 测速带宽: ${bandwidth} Mbps"
             fi
@@ -1718,7 +1735,19 @@ detect_optimal_mtu() {
     local mtu=1500  # 默认值
     local low=1200
     local high=1500
-    
+
+    # 探测 ping 是否支持 GNU 特有的 -M do 选项（BusyBox/非 GNU ping 不支持）
+    if ! ping -M do -c 1 -W 1 -s 100 "$target" >/dev/null 2>&1; then
+        # 区分"ping 不支持 -M"与"目标不可达"：用 -M 触发参数错误时也会失败，
+        # 因此再做一次不带 -M 的探测确认 ping 本身可用
+        if ping -M do 2>&1 | grep -qiE 'invalid option|unrecognized|usage'; then
+            log_warn "当前 ping 不支持 -M do 选项，跳过 MTU 探测，保持默认 1500"
+            SMART_OPTIMAL_MTU=$mtu
+            echo "$mtu"
+            return 0
+        fi
+    fi
+
     # 二分法探测
     while [[ $low -lt $high ]]; do
         local mid=$(( (low + high + 1) / 2 ))
@@ -1762,7 +1791,7 @@ apply_mss_clamp() {
     log_info "启用 MSS Clamp..."
     
     local nic
-    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     
     if [[ -z "$nic" ]]; then
         log_warn "无法检测默认网卡，跳过 MSS Clamp"
@@ -1797,7 +1826,7 @@ remove_mss_clamp() {
     log_info "移除 MSS Clamp..."
     
     local nic
-    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     
     if [[ -n "$nic" ]]; then
         iptables -t mangle -D POSTROUTING -o "$nic" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
@@ -2333,6 +2362,8 @@ apply_scene_mode() {
 #"
     fi
     
+    local algo_value
+    algo_value=$(resolve_algo_value "$algo")
     cat > "$SYSCTL_FILE" << CONF
 # BBR3 Script 场景配置
 # 场景模式: $(get_scene_name "$mode")
@@ -2343,7 +2374,7 @@ ${proxy_header}
 # ========== 拥塞控制（自动检测最佳算法）==========
 # 算法: ${algo} (自动选择: BBR3 > BBR2 > BBR > CUBIC)
 # 队列: ${qdisc} (根据场景自动匹配)
-net.ipv4.tcp_congestion_control = ${algo}
+net.ipv4.tcp_congestion_control = ${algo_value}
 net.core.default_qdisc = ${qdisc}
 
 # ========== 缓冲区配置 ==========
@@ -2646,31 +2677,28 @@ check_current_kernel() {
     local has_bbr3=false
     local is_mainline_bbr3=false
     
+    local has_bbr1=false
     if [[ -f /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
-        # 检查是否有 bbr3 算法
-        if grep -q "bbr3" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        # 只有真正支持 BBRv3 的内核（XanMod 或显式提供 bbr3）才算 BBRv3
+        if kernel_has_bbr3; then
             has_bbr3=true
-        # 检查主线内核 >= 6.9 的 BBR3 (以 bbr 名称提供)
+            is_mainline_bbr3=true
         elif grep -q "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-            if version_ge "$kver_short" "6.9.0"; then
-                has_bbr3=true
-                is_mainline_bbr3=true
-            fi
+            # 主线内核仅有 BBR v1
+            has_bbr1=true
         fi
     fi
-    
+
     echo
     echo -e "  ${BOLD}内核检测${NC}"
     print_separator
     echo
     printf "    %-15s : %s\n" "当前内核" "$kernel_version"
-    
+
     if [[ "$has_bbr3" == "true" ]]; then
-        if [[ "$is_mainline_bbr3" == "true" ]]; then
-            printf "    %-15s : ${GREEN}✅ 已支持 (内核内置)${NC}\n" "BBR3 支持"
-        else
-            printf "    %-15s : ${GREEN}✅ 已支持${NC}\n" "BBR3 支持"
-        fi
+        printf "    %-15s : ${GREEN}✅ 已支持 (XanMod 内置 BBRv3)${NC}\n" "BBR3 支持"
+    elif [[ "$has_bbr1" == "true" ]]; then
+        printf "    %-15s : ${YELLOW}⚠️ 仅 BBR v1 (主线内核无 BBRv3，可安装 XanMod)${NC}\n" "BBR3 支持"
     else
         printf "    %-15s : ${YELLOW}❌ 需要安装新内核${NC}\n" "BBR3 支持"
     fi
@@ -3343,8 +3371,6 @@ net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
 
-# 路由缓存优化
-net.ipv4.route.max_size = 2147483647
 EOF
 }
 
@@ -3360,7 +3386,6 @@ net.core.default_qdisc = fq
 
 # ========== 核心抗丢包参数 ==========
 # 增加 TCP 重传次数（默认 15，高丢包环境需要更多）
-net.ipv4.tcp_retries1 = 5
 net.ipv4.tcp_retries2 = 30
 
 # 增加 SYN 重试次数（默认 6）
@@ -3411,7 +3436,7 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_base_mss = 1024
 
 # ========== ECN 显式拥塞通知 ==========
-net.ipv4.tcp_ecn = 2
+net.ipv4.tcp_ecn = 1
 net.ipv4.tcp_ecn_fallback = 1
 
 # ========== 其他优化 ==========
@@ -3488,7 +3513,7 @@ CONF
     # 优化网卡队列
     print_step "优化网卡队列..."
     local nic
-    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     if [[ -n "$nic" ]]; then
         # 增加网卡队列长度
         ip link set "$nic" txqueuelen 10000 2>/dev/null && \
@@ -3612,11 +3637,10 @@ net.ipv4.tcp_sack = 1
 # 快速重传和恢复
 net.ipv4.tcp_early_retrans = 3
 net.ipv4.tcp_frto = 2
-net.ipv4.tcp_retries1 = 5
 net.ipv4.tcp_retries2 = 30
 net.ipv4.tcp_orphan_retries = 5
 net.ipv4.tcp_syn_retries = 6
-net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_synack_retries = 5
 net.ipv4.tcp_fin_timeout = 30
 
 # ========== Keepalive 优化（防止大文件传输中断）==========
@@ -3672,7 +3696,7 @@ line_dns_prefetch() {
     if [[ -n "$resolved_ips" ]]; then
         echo "$resolved_ips" | sort -u > "$LINE_IP_FILE"
         local count
-        count=$(wc -l < "$LINE_IP_FILE")
+        count=$(grep -c . "$LINE_IP_FILE")
         print_success "DNS 预解析完成，获取 $count 个 IP"
     else
         print_warn "DNS 预解析失败，请检查网络"
@@ -3801,7 +3825,7 @@ line_route_optimize() {
     while read -r ip; do
         [[ -z "$ip" ]] && continue
         # 添加高优先级路由
-        if ip route add "$ip/32" via "$gateway" dev "$nic" metric 10 2>/dev/null; then
+        if ip route replace "$ip/32" via "$gateway" dev "$nic" metric 10 2>/dev/null; then
             ((route_count++))
         fi
     done < "$LINE_IP_FILE"
@@ -3869,7 +3893,7 @@ line_optimization_menu() {
         fi
         if [[ -f "$LINE_IP_FILE" ]]; then
             local ip_count
-            ip_count=$(wc -l < "$LINE_IP_FILE")
+            ip_count=$(grep -c . "$LINE_IP_FILE")
             echo -e "    IP 列表: ${GREEN}${ip_count} 个${NC}"
         else
             echo -e "    IP 列表: ${YELLOW}未生成${NC}"
@@ -4005,6 +4029,15 @@ line_remove_optimization() {
     rm -f /usr/local/bin/bbr3-line-warmup
     systemctl daemon-reload
     
+    print_step "移除路由优化..."
+    if [[ -f "$LINE_IP_FILE" ]]; then
+        local _route_ip
+        while read -r _route_ip; do
+            [[ -z "$_route_ip" ]] && continue
+            ip route del "$_route_ip/32" 2>/dev/null
+        done < "$LINE_IP_FILE"
+    fi
+
     print_step "移除 IP 列表..."
     rm -f "$LINE_IP_FILE"
     rm -f "$LINE_CONFIG_FILE"
@@ -4202,7 +4235,7 @@ app_dns_prefetch() {
     if [[ -n "$resolved_ips" ]]; then
         echo "$resolved_ips" | sort -u > "$ip_file"
         local count
-        count=$(wc -l < "$ip_file")
+        count=$(grep -c . "$ip_file")
         print_success "${app_name} DNS 预解析完成，获取 $count 个 IP"
     else
         print_warn "${app_name} DNS 预解析失败"
@@ -4261,7 +4294,7 @@ app_optimization_menu() {
             local ip_file="${APP_IP_DIR}/${app,,}-ips.conf"
             [[ "$app" == "LINE" ]] && ip_file="$LINE_IP_FILE"
             if [[ -f "$ip_file" ]]; then
-                local count=$(wc -l < "$ip_file" 2>/dev/null || echo 0)
+                local count=$(grep -c . "$ip_file" 2>/dev/null || echo 0)
                 echo -e "    ${GREEN}✓${NC} ${app} (${count} IPs)"
                 ((optimized_count++))
             fi
@@ -4507,8 +4540,8 @@ get_line_params() {
             echo "# 普通线路优化 (4837/163)"
             echo "# 线路质量一般，增大缓冲区和重试次数"
             echo "net.ipv4.tcp_retries2 = 15"
-            echo "net.ipv4.tcp_syn_retries = 3"
-            echo "net.ipv4.tcp_synack_retries = 3"
+            echo "net.ipv4.tcp_syn_retries = 6"
+            echo "net.ipv4.tcp_synack_retries = 5"
             ;;
     esac
 }
@@ -4544,7 +4577,9 @@ generate_proxy_config() {
     local best_algo best_qdisc
     best_algo=$(suggest_best_algo 2>/dev/null || echo "bbr")
     best_qdisc=$(suggest_best_qdisc "proxy" 2>/dev/null || echo "fq")
-    
+    local best_algo_value
+    best_algo_value=$(resolve_algo_value "$best_algo")
+
     # 生成新配置
     cat > "$config_file" << EOF
 # BBR3 代理服务器智能调优配置
@@ -4557,7 +4592,7 @@ generate_proxy_config() {
 
 # ========== 拥塞控制 ==========
 # 算法: ${best_algo} (动态检测: BBR3 > BBR2 > BBR > CUBIC)
-net.ipv4.tcp_congestion_control = ${best_algo}
+net.ipv4.tcp_congestion_control = ${best_algo_value}
 net.core.default_qdisc = ${best_qdisc}
 
 # ========== 基础 TCP 优化 ==========
@@ -4850,8 +4885,10 @@ show_current_optimization() {
     # 缓冲区设置
     echo "    【缓冲区设置】"
     local rmem_max wmem_max
-    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "未知")
-    wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo "未知")
+    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+    [[ "$rmem_max" =~ ^[0-9]+$ ]] || rmem_max=0
+    [[ "$wmem_max" =~ ^[0-9]+$ ]] || wmem_max=0
     printf "      %-20s : %s bytes (%s MB)\n" "rmem_max" "$rmem_max" "$((rmem_max / 1024 / 1024))"
     printf "      %-20s : %s bytes (%s MB)\n" "wmem_max" "$wmem_max" "$((wmem_max / 1024 / 1024))"
     echo
@@ -5037,6 +5074,7 @@ proxy_tune_wizard() {
     
     # 计算缓冲区
     calculate_bdp_buffer >/dev/null 2>&1
+    [[ "${SMART_OPTIMAL_BUFFER:-}" =~ ^[0-9]+$ ]] || SMART_OPTIMAL_BUFFER=0
     local buffer_mb=$((SMART_OPTIMAL_BUFFER / 1024 / 1024))
     [[ $buffer_mb -eq 0 ]] && buffer_mb=64
     print_kv "推荐缓冲区" "${buffer_mb}MB"
@@ -5136,17 +5174,15 @@ verify_kernel_bbr3() {
         printf "    %-25s : ${GREEN}✅ BBR3 已启用${NC}\n" "拥塞控制"
         VERIFY_KERNEL_STATUS=100
     elif [[ "$current_algo" == "bbr" ]]; then
-        # 检查是否是 6.9+ 内核的 BBR3
-        local kver_short
-        kver_short=$(echo "$kernel_version" | sed 's/[^0-9.].*$//')
-        if version_ge "$kver_short" "6.9.0"; then
-            printf "    %-25s : ${GREEN}✅ BBR3 已启用 (内核内置)${NC}\n" "拥塞控制"
+        # bbr 可能是 XanMod 内置的 BBRv3，也可能是主线内核的 BBR v1
+        if kernel_has_bbr3; then
+            printf "    %-25s : ${GREEN}✅ BBRv3 已启用 (XanMod)${NC}\n" "拥塞控制"
             VERIFY_KERNEL_STATUS=100
         else
-            printf "    %-25s : ${YELLOW}⚠️ BBR 已启用 (非 BBR3)${NC}\n" "拥塞控制"
+            printf "    %-25s : ${YELLOW}⚠️ BBR v1 已启用 (主线内核，非 BBRv3)${NC}\n" "拥塞控制"
             VERIFY_KERNEL_STATUS=70
             VERIFY_ISSUES+=("BBR 已启用但非 BBR3 版本")
-            VERIFY_FIXES+=("升级内核到 6.9+ 或安装 XanMod 内核")
+            VERIFY_FIXES+=("升级到 XanMod 内核以获得 BBRv3")
         fi
     elif [[ "$bbr3_available" == "true" ]] || [[ "$bbr_available" == "true" ]]; then
         printf "    %-25s : ${YELLOW}⚠️ BBR 可用但未启用 (当前: $current_algo)${NC}\n" "拥塞控制"
@@ -5164,7 +5200,11 @@ verify_kernel_bbr3() {
     printf "    %-25s : %s\n" "可用算法" "$available_algos"
     echo
     
-    return $([[ $VERIFY_KERNEL_STATUS -ge 70 ]] && echo 0 || echo 1)
+    if [[ $VERIFY_KERNEL_STATUS -ge 70 ]]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 # 验证内核模块
@@ -5247,7 +5287,9 @@ verify_buffer_settings() {
     local rmem_max wmem_max
     rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
     wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
-    
+    [[ "$rmem_max" =~ ^[0-9]+$ ]] || rmem_max=0
+    [[ "$wmem_max" =~ ^[0-9]+$ ]] || wmem_max=0
+
     echo -e "  ${BOLD}缓冲区验证${NC}"
     print_separator
     echo
@@ -5436,13 +5478,15 @@ calculate_health_score() {
     local total_score=0
     local weight_kernel=30
     local weight_algo=20
+    local weight_qdisc=10
     local weight_buffer=20
-    local weight_tcp=15
-    local weight_service=15
-    
+    local weight_tcp=10
+    local weight_service=10
+
     total_score=$((
         VERIFY_KERNEL_STATUS * weight_kernel / 100 +
         VERIFY_ALGO_STATUS * weight_algo / 100 +
+        VERIFY_QDISC_STATUS * weight_qdisc / 100 +
         VERIFY_BUFFER_STATUS * weight_buffer / 100 +
         VERIFY_TCP_STATUS * weight_tcp / 100 +
         VERIFY_SERVICE_STATUS * weight_service / 100
@@ -5476,7 +5520,7 @@ verify_smart_optimization() {
     
     # 检查 MSS Clamp
     local nic
-    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     local mss_status="未启用"
     if [[ -n "$nic" ]] && iptables -t mangle -C POSTROUTING -o "$nic" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
         mss_status="${GREEN}✅ 已启用${NC}"
@@ -5870,7 +5914,9 @@ repair_sysctl_config() {
 write_sysctl() {
     local algo="$1"
     local qdisc="$2"
-    
+    local algo_value
+    algo_value=$(resolve_algo_value "$algo")
+
     log_debug "写入 sysctl 配置: algo=${algo}, qdisc=${qdisc}"
     
     # 先备份
@@ -5886,7 +5932,7 @@ write_sysctl() {
 # 版本: ${SCRIPT_VERSION}
 
 # TCP 拥塞控制算法
-net.ipv4.tcp_congestion_control = ${algo}
+net.ipv4.tcp_congestion_control = ${algo_value}
 
 # 默认队列规则
 net.core.default_qdisc = ${qdisc}
@@ -6058,11 +6104,9 @@ algo_supported() {
         return 0
     fi
     
-    # BBR3 兼容性检查（某些内核以 bbr 名称提供 BBR3）
+    # BBR3 兼容性检查（某些内核如 XanMod 以 bbr 名称提供 BBRv3）
     if [[ "$algo" == "bbr3" ]]; then
-        local kver
-        kver=$(uname -r | sed 's/[^0-9.].*$//')
-        if echo "$available" | grep -qw "bbr" && version_ge "$kver" "6.9.0"; then
+        if echo "$available" | grep -qw "bbr" && kernel_has_bbr3; then
             return 0
         fi
     fi
@@ -6095,16 +6139,53 @@ qdisc_supported() {
     esac
 }
 
+# 将逻辑算法名解析为内核真正接受的 sysctl 值
+# bbr3/bbr2 在绝大多数内核里都注册为 "bbr"；仅当内核确实在
+# tcp_available_congestion_control 中列出该名字时才原样使用。
+resolve_algo_value() {
+    local algo="$1"
+    local available
+    available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "")
+    case "$algo" in
+        bbr3|bbr2)
+            if echo " $available " | grep -qw "$algo"; then
+                echo "$algo"
+            else
+                echo "bbr"
+            fi
+            ;;
+        *)
+            echo "$algo"
+            ;;
+    esac
+}
+
+# 判断当前运行内核是否真正支持 BBRv3
+# 主线内核（无论版本多高）只有 BBR v1；BBRv3 仅来自 XanMod 等打过补丁的内核。
+kernel_has_bbr3() {
+    local kver
+    kver=$(uname -r)
+    # 内核显式提供独立的 bbr3 算法名
+    if grep -qw "bbr3" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        return 0
+    fi
+    # XanMod 内核内置 Google BBRv3（注册为 bbr）
+    if [[ "$kver" == *xanmod* ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # 规范化算法名称
 normalize_algo() {
     local algo="$1"
     local kver
     kver=$(uname -r | sed 's/[^0-9.].*$//')
     
-    # BBR3 可能以 bbr 名称提供
+    # BBR3 可能以 bbr 名称提供（XanMod 等内核）
     if [[ "$algo" == "bbr3" ]]; then
         if ! echo "$(detect_available_algos)" | grep -qw "bbr3"; then
-            if echo "$(detect_available_algos)" | grep -qw "bbr" && version_ge "$kver" "6.9.0"; then
+            if echo "$(detect_available_algos)" | grep -qw "bbr" && kernel_has_bbr3; then
                 print_info "此内核以 'bbr' 名称提供 BBRv3" >&2
                 echo "bbr"
                 return 0
@@ -6126,8 +6207,8 @@ suggest_best_algo() {
         return
     fi
     
-    # 检测主线 6.9+ 内核的 BBRv3（以 bbr 名称提供）
-    if algo_supported "bbr" && version_ge "$kver" "6.9.0"; then
+    # 检测 XanMod 等内核内置的 BBRv3（以 bbr 名称提供）
+    if algo_supported "bbr" && kernel_has_bbr3; then
         echo "bbr"  # 实际是 BBRv3
         return
     fi
@@ -6296,7 +6377,7 @@ detect_available_qdiscs() {
     # 检测 fq_pie（Linux 5.6+）
     if modprobe sch_fq_pie 2>/dev/null || lsmod | grep -q '^sch_fq_pie'; then
         available="$available fq_pie"
-    elif [[ -f /lib/modules/$(uname -r)/kernel/net/sched/sch_fq_pie.ko* ]]; then
+    elif compgen -G "/lib/modules/$(uname -r)/kernel/net/sched/sch_fq_pie.ko*" >/dev/null; then
         modprobe sch_fq_pie 2>/dev/null
         available="$available fq_pie"
     fi
@@ -6304,7 +6385,7 @@ detect_available_qdiscs() {
     # 检测 cake（Linux 4.19+，需要 sch_cake 模块）
     if modprobe sch_cake 2>/dev/null || lsmod | grep -q '^sch_cake'; then
         available="$available cake"
-    elif [[ -f /lib/modules/$(uname -r)/kernel/net/sched/sch_cake.ko* ]]; then
+    elif compgen -G "/lib/modules/$(uname -r)/kernel/net/sched/sch_cake.ko*" >/dev/null; then
         modprobe sch_cake 2>/dev/null
         available="$available cake"
     fi
@@ -7095,7 +7176,17 @@ verify_kernel_installation() {
     if [[ -f /etc/default/grub ]]; then
         local grub_default
         grub_default=$(grep "^GRUB_DEFAULT=" /etc/default/grub 2>/dev/null | cut -d= -f2 | tr -d '"')
-        if [[ "$grub_default" == "0" ]] || [[ "$grub_default" == "saved" ]]; then
+        if [[ "$grub_default" == "saved" ]]; then
+            # GRUB_DEFAULT=saved：需检查 grubenv 中的 saved_entry 是否指向新内核
+            local saved_entry=""
+            saved_entry=$(grub-editenv list 2>/dev/null || grub2-editenv list 2>/dev/null || true)
+            if [[ -n "$kernel_version" ]] && echo "$saved_entry" | grep -q "$kernel_version"; then
+                echo -e " [${GREEN}${ICON_OK}${NC}] 默认启动项已指向新内核"
+            else
+                echo -e " [${YELLOW}${ICON_WARN}${NC}] GRUB_DEFAULT=saved，无法确认默认启动项"
+                echo "      请手动确认默认启动项已指向新内核 (${kernel_version})"
+            fi
+        elif [[ "$grub_default" == "0" ]]; then
             # 获取第一个启动项
             if [[ -n "$grub_cfg" ]]; then
                 default_kernel=$(grep -m1 "menuentry.*linux" "$grub_cfg" 2>/dev/null | head -1)
@@ -7176,7 +7267,7 @@ verify_grub_config() {
         grub_cfg="/boot/grub/grub.cfg"
     elif [[ -f /boot/grub2/grub.cfg ]]; then
         grub_cfg="/boot/grub2/grub.cfg"
-    elif [[ -f /boot/efi/EFI/*/grub.cfg ]]; then
+    elif compgen -G "/boot/efi/EFI/*/grub.cfg" >/dev/null 2>&1; then
         grub_cfg=$(ls /boot/efi/EFI/*/grub.cfg 2>/dev/null | head -1)
     fi
     
@@ -7226,7 +7317,16 @@ update_grub_config() {
         dnf|yum)
             if command -v grub2-mkconfig >/dev/null 2>&1; then
                 local grub_cfg="/boot/grub2/grub.cfg"
-                [[ -d /boot/efi/EFI ]] && grub_cfg="/boot/efi/EFI/$(ls /boot/efi/EFI/ | grep -v BOOT | head -1)/grub.cfg"
+                if [[ -d /boot/efi/EFI ]]; then
+                    # 使用共享解析器定位 EFI grub.cfg，避免多厂商目录下路径分歧
+                    local located_cfg
+                    located_cfg="$(locate_grub_cfg || true)"
+                    if [[ -n "$located_cfg" ]]; then
+                        grub_cfg="$located_cfg"
+                    else
+                        grub_cfg="/boot/grub2/grub.cfg"
+                    fi
+                fi
                 grub2-mkconfig -o "$grub_cfg" || return 1
             else
                 print_error "未找到 GRUB 更新命令"
@@ -7236,6 +7336,356 @@ update_grub_config() {
     esac
     
     print_success "GRUB 配置已更新"
+    return 0
+}
+
+#===============================================================================
+# GRUB 一次性引导安全模式（grub-reboot safety mode）
+#===============================================================================
+
+# 在 grub.cfg 中查找指定内核版本对应的菜单项 id（含 submenu 路径，> 分隔）
+# 用法: find_grub_entry_id "<kernel_version>" "<grub_cfg_path>"
+# 成功 echo "submenu_id>entry_id"（或顶层 entry_id），返回 0；找不到返回 1
+find_grub_entry_id() {
+    local kver="${1:-}" grub_cfg="${2:-}"
+    [[ -n "$kver" && -n "$grub_cfg" ]] || return 1
+    [[ -f "$grub_cfg" ]] || return 1
+    local id
+    id=$(awk -v kver="$kver" -v q="'" '
+        # 跟踪花括号深度（grub-mkconfig 输出每行至多一个花括号）
+        function lastquoted(line,   nn, aa) {
+            nn = split(line, aa, q)
+            if (nn >= 3) return aa[nn-1]
+            return ""
+        }
+        {
+            line = $0
+            # submenu 行：记录其 id 与开启时的深度
+            if (line ~ /^[[:space:]]*submenu[[:space:]]/) {
+                eidtmp = lastquoted(line)
+                if (eidtmp != "") { cur = eidtmp; subdepth = depth }
+            }
+            # menuentry 行：进入目标 menuentry 状态
+            else if (line ~ /^[[:space:]]*menuentry[[:space:]]/) {
+                eid = lastquoted(line)
+                etitle = ""
+                if (split(line, ta, q) >= 2) etitle = ta[2]
+                in_entry = 1
+                found_linux = 0
+                ekver = ""
+            }
+            # 目标 menuentry 块内首个 linux 行：提取精确内核版本
+            else if (in_entry == 1 && found_linux == 0 && \
+                     line ~ /^[[:space:]]*(linux|linux16|linuxefi)[[:space:]]/) {
+                found_linux = 1
+                ekver = ""
+                for (i = 2; i <= NF; i++) {
+                    if (substr($i, 1, 1) == "/") {
+                        bn = $i
+                        sub(/.*\//, "", bn)
+                        sub(/^vmlinuz-/, "", bn)
+                        sub(/^kernel-/, "", bn)
+                        ekver = bn
+                        break
+                    }
+                }
+                if (ekver == kver && index(etitle, "recovery") == 0) {
+                    if (cur != "") print cur ">" eid; else print eid
+                    exit
+                }
+            }
+
+            # 花括号深度跟踪
+            if (line ~ /\{/) depth++
+            if (line ~ /\}/) {
+                depth--
+                in_entry = 0
+                # submenu 块结束：清除 submenu 上下文
+                if (cur != "" && depth <= subdepth) {
+                    cur = ""
+                    subdepth = 0
+                }
+            }
+        }
+    ' "$grub_cfg" 2>/dev/null)
+    [[ -n "$id" ]] && { echo "$id"; return 0; }
+    return 1
+}
+
+# 查找一个可作为已知良好回退的内核菜单项 id（排除 exclude_id 与 recovery 项）
+# 优先选择 grub.cfg 中最后一个（最旧）的内核项
+find_fallback_grub_entry_id() {
+    local exclude_id="${1:-}" grub_cfg="${2:-}"
+    [[ -n "$grub_cfg" ]] || return 1
+    [[ -f "$grub_cfg" ]] || return 1
+    local id
+    id=$(awk -v exclude="$exclude_id" -v q="'" '
+        function lastquoted(line,   nn, aa) {
+            nn = split(line, aa, q)
+            if (nn >= 3) return aa[nn-1]
+            return ""
+        }
+        {
+            line = $0
+            if (line ~ /^[[:space:]]*submenu[[:space:]]/) {
+                eidtmp = lastquoted(line)
+                if (eidtmp != "") { cur = eidtmp; subdepth = depth }
+            }
+            else if (line ~ /^[[:space:]]*menuentry[[:space:]]/) {
+                eid = lastquoted(line)
+                etitle = ""
+                if (split(line, ta, q) >= 2) etitle = ta[2]
+                in_entry = 1
+                found_linux = 0
+            }
+            else if (in_entry == 1 && found_linux == 0 && \
+                     line ~ /^[[:space:]]*(linux|linux16|linuxefi)[[:space:]]/) {
+                found_linux = 1
+                has_kernel = 0
+                for (i = 2; i <= NF; i++) {
+                    if (substr($i, 1, 1) == "/") {
+                        bn = $i
+                        sub(/.*\//, "", bn)
+                        if (bn ~ /^vmlinuz-/ || bn ~ /^kernel-/) has_kernel = 1
+                        break
+                    }
+                }
+                if (has_kernel == 1 && index(etitle, "recovery") == 0) {
+                    if (cur != "") fid = cur ">" eid; else fid = eid
+                    if (fid != exclude) last = fid
+                }
+            }
+            if (line ~ /\{/) depth++
+            if (line ~ /\}/) {
+                depth--
+                in_entry = 0
+                if (cur != "" && depth <= subdepth) {
+                    cur = ""
+                    subdepth = 0
+                }
+            }
+        }
+        END { if (last != "") print last }
+    ' "$grub_cfg" 2>/dev/null)
+    [[ -n "$id" ]] && { echo "$id"; return 0; }
+    return 1
+}
+
+# 检测 GRUB 工具命令，echo "<reboot_cmd>|<setdef_cmd>"
+# Debian: grub-reboot / grub-set-default ; RHEL: grub2-reboot / grub2-set-default
+# 找不到 reboot 命令时该字段为空
+detect_grub_tools() {
+    local reboot_cmd="" setdef_cmd=""
+    if command -v grub-reboot >/dev/null 2>&1; then reboot_cmd="grub-reboot"
+    elif command -v grub2-reboot >/dev/null 2>&1; then reboot_cmd="grub2-reboot"; fi
+    if command -v grub-set-default >/dev/null 2>&1; then setdef_cmd="grub-set-default"
+    elif command -v grub2-set-default >/dev/null 2>&1; then setdef_cmd="grub2-set-default"; fi
+    echo "${reboot_cmd}|${setdef_cmd}"
+}
+
+# 定位 grub.cfg，echo 首个存在的路径（找不到则 echo 空）
+locate_grub_cfg() {
+    local cfg
+    for cfg in /boot/grub/grub.cfg /boot/grub2/grub.cfg /boot/efi/EFI/*/grub.cfg; do
+        if [[ -f "$cfg" ]]; then
+            echo "$cfg"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 安装新内核后配置一次性引导：旧内核固定为持久默认，新内核仅引导一次
+setup_kernel_oneshot_boot() {
+    local new_version="${1:-}"
+    [[ -n "$new_version" ]] || return 1
+
+    print_step "配置内核一次性引导安全模式..."
+
+    local running
+    running="$(uname -r)"
+
+    local grub_cfg
+    grub_cfg="$(locate_grub_cfg)"
+    if [[ -z "$grub_cfg" ]]; then
+        print_warn "未找到 grub.cfg，跳过一次性引导配置，新内核可能成为默认，请重启后确认"
+        return 1
+    fi
+
+    local tools reboot_cmd setdef_cmd
+    tools="$(detect_grub_tools)"
+    reboot_cmd="${tools%%|*}"
+    setdef_cmd="${tools##*|}"
+
+    local new_id old_id
+    new_id="$(find_grub_entry_id "$new_version" "$grub_cfg" || true)"
+    old_id="$(find_grub_entry_id "$running" "$grub_cfg" || true)"
+
+    # 旧内核（运行内核）无法定位时，回退到任意其它已安装内核项作为已知良好默认
+    if [[ -z "$old_id" ]]; then
+        old_id="$(find_fallback_grub_entry_id "$new_id" "$grub_cfg" || true)"
+        [[ -n "$old_id" ]] && print_warn "无法定位运行内核 ${running} 的菜单项，改用其它已安装内核作为回退默认"
+    fi
+
+    # 若仍无任何可作为回退的内核项，不能继续，否则新内核会成为未验证的默认
+    if [[ -z "$old_id" ]]; then
+        print_error "未找到任何可作为已知良好回退的内核菜单项。"
+        print_error "为避免新内核成为未经验证的默认启动项，已中止一次性引导配置。"
+        return 2
+    fi
+
+    if [[ -z "$reboot_cmd" || -z "$setdef_cmd" || -z "$new_id" ]]; then
+        print_warn "无法配置安全的一次性引导（缺少 GRUB 工具或菜单项）"
+        print_warn "新内核 ${new_version} 可能会成为默认启动项。"
+        print_warn "请务必在重启后确认新内核能正常启动；"
+        print_warn "若新内核无法启动，请在 GRUB 的「Advanced options」菜单中"
+        print_warn "手动选择旧内核 ${running} 启动，然后检查或卸载新内核。"
+        return 1
+    fi
+
+    # 确保 /etc/default/grub 使用 GRUB_DEFAULT=saved
+    local grub_default="/etc/default/grub"
+    if [[ -f "$grub_default" ]]; then
+        if [[ ! -f "${grub_default}.easybbr3.bak" ]]; then
+            cp -a "$grub_default" "${grub_default}.easybbr3.bak" 2>/dev/null || true
+        fi
+        if grep -qE '^GRUB_DEFAULT=' "$grub_default" 2>/dev/null; then
+            if ! grep -qE '^GRUB_DEFAULT=saved[[:space:]]*$' "$grub_default" 2>/dev/null; then
+                sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' "$grub_default" 2>/dev/null || true
+            fi
+        else
+            echo 'GRUB_DEFAULT=saved' >> "$grub_default" 2>/dev/null || true
+        fi
+    else
+        print_warn "未找到 ${grub_default}，无法设置 GRUB_DEFAULT=saved"
+        return 1
+    fi
+
+    # 重新生成 grub.cfg 使其遵循 saved_entry
+    if ! update_grub_config; then
+        print_warn "GRUB 配置重新生成失败，跳过一次性引导配置"
+        return 1
+    fi
+
+    # 重新生成后重新定位并查找菜单项（以重新生成结果为准）
+    grub_cfg="$(locate_grub_cfg)"
+    if [[ -z "$grub_cfg" ]]; then
+        print_warn "重新生成后未找到 grub.cfg，跳过一次性引导配置"
+        return 1
+    fi
+    new_id="$(find_grub_entry_id "$new_version" "$grub_cfg" || true)"
+    old_id="$(find_grub_entry_id "$running" "$grub_cfg" || true)"
+    if [[ -z "$old_id" ]]; then
+        old_id="$(find_fallback_grub_entry_id "$new_id" "$grub_cfg" || true)"
+    fi
+    if [[ -z "$old_id" ]]; then
+        print_error "重新生成后未找到任何可作为已知良好回退的内核菜单项，已中止一次性引导配置。"
+        return 2
+    fi
+    if [[ -z "$new_id" ]]; then
+        print_warn "重新生成后无法定位新内核菜单项，跳过一次性引导配置"
+        return 1
+    fi
+
+    # 旧内核固定为持久默认
+    if ! "$setdef_cmd" "$old_id"; then
+        print_error "设置默认启动项失败（${setdef_cmd}）"
+        return 1
+    fi
+    # 新内核仅下次引导一次
+    if ! "$reboot_cmd" "$new_id"; then
+        print_error "设置一次性引导失败（${reboot_cmd}）"
+        return 1
+    fi
+
+    # 写入待确认标记文件
+    mkdir -p "$(dirname "$KERNEL_PENDING_FILE")" 2>/dev/null || true
+    {
+        echo "version=${new_version}"
+        echo "install_epoch=$(date +%s)"
+        echo "old_kernel=${running}"
+    } > "$KERNEL_PENDING_FILE" 2>/dev/null || print_warn "无法写入待确认标记文件"
+
+    print_success "已配置内核一次性引导安全模式"
+    print_kv "一次性引导" "新内核 ${new_version} 仅下次重启引导一次"
+    print_kv "失败回滚" "若新内核无法启动，断电重启即自动回到旧内核 ${running}"
+    print_kv "确认生效" "新内核正常启动后，再次运行 ${SCRIPT_NAME} 会自动设为默认"
+    return 0
+}
+
+# 启动时检查：若存在待确认标记，判断新内核是否引导成功
+# 必须静默（无标记时直接返回），且永不 exit 或中断脚本
+kernel_finalize_check() {
+    [[ -f "$KERNEL_PENDING_FILE" ]] || return 0
+
+    local version="" install_epoch="" old_kernel=""
+    version="$(grep -E '^version=' "$KERNEL_PENDING_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    install_epoch="$(grep -E '^install_epoch=' "$KERNEL_PENDING_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    old_kernel="$(grep -E '^old_kernel=' "$KERNEL_PENDING_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+
+    if [[ -z "$version" ]]; then
+        rm -f "$KERNEL_PENDING_FILE" 2>/dev/null || true
+        return 0
+    fi
+
+    # 失效检测：标记内核文件已不存在（系统重装 / 内核被删）→ 静默清理标记
+    if [[ ! -e "/boot/vmlinuz-${version}" \
+          && ! -e "/boot/vmlinuz-${version}.img" \
+          && ! -d "/lib/modules/${version}" ]]; then
+        rm -f "$KERNEL_PENDING_FILE" 2>/dev/null || true
+        return 0
+    fi
+
+    local running
+    running="$(uname -r)"
+
+    # 计算本次启动的大致时间戳
+    local boot_epoch="" now_epoch uptime_seconds
+    now_epoch="$(date +%s 2>/dev/null || echo 0)"
+    uptime_seconds="$(cut -d' ' -f1 /proc/uptime 2>/dev/null || true)"
+    uptime_seconds="${uptime_seconds%.*}"
+    if [[ -n "$uptime_seconds" && "$uptime_seconds" =~ ^[0-9]+$ && "$now_epoch" =~ ^[0-9]+$ ]]; then
+        boot_epoch=$(( now_epoch - uptime_seconds ))
+    fi
+
+    local rebooted_since_install=0
+    if [[ -n "$install_epoch" && "$install_epoch" =~ ^[0-9]+$ \
+          && -n "$boot_epoch" && "$boot_epoch" -gt "$install_epoch" ]]; then
+        rebooted_since_install=1
+    fi
+
+    if [[ "$running" == "$version" ]]; then
+        # CASE A：新内核已成功启动
+        print_success "检测到新内核 ${version} 已成功启动"
+        local grub_cfg tools setdef_cmd new_id
+        grub_cfg="$(locate_grub_cfg || true)"
+        tools="$(detect_grub_tools)"
+        setdef_cmd="${tools##*|}"
+        new_id=""
+        [[ -n "$grub_cfg" ]] && new_id="$(find_grub_entry_id "$version" "$grub_cfg" || true)"
+        if [[ -n "$setdef_cmd" && -n "$new_id" ]]; then
+            if "$setdef_cmd" "$new_id" 2>/dev/null; then
+                print_success "已将 ${version} 设为默认启动项"
+            else
+                print_warn "无法自动将 ${version} 设为默认，请手动设置"
+            fi
+        else
+            print_warn "无法自动设为默认，请手动设置"
+        fi
+        rm -f "$KERNEL_PENDING_FILE" 2>/dev/null || true
+    elif [[ -n "$old_kernel" && "$running" == "$old_kernel" ]]; then
+        # CASE B：当前内核正是记录的旧内核 —— 与时钟无关的确凿证据：新内核引导失败已回退
+        print_warn "${ICON_WARN} 新内核 ${version} 引导失败 —— 系统已回退到旧内核 ${running}。新内核可能与本机不兼容，建议检查或卸载该内核。"
+        rm -f "$KERNEL_PENDING_FILE" 2>/dev/null || true
+    elif [[ "$rebooted_since_install" -eq 1 ]]; then
+        # CASE B2：已重启但当前内核既非新内核也非记录的旧内核
+        print_warn "${ICON_WARN} 新内核 ${version} 未生效，当前内核为 ${running}，请检查。"
+        rm -f "$KERNEL_PENDING_FILE" 2>/dev/null || true
+    else
+        # CASE C：尚未重启，仍处于待验证状态
+        print_info "新内核 ${version} 已安装，将在下次重启时引导一次以验证。"
+    fi
+
     return 0
 }
 
@@ -7330,6 +7780,28 @@ safe_kernel_install() {
     
     print_success "${kernel_type} 内核安装并验证成功"
     print_kernel_post_install_summary "$kernel_type"
+
+    # 配置一次性引导安全模式
+    if [[ -n "${INSTALLED_KERNEL_VERSION:-}" ]]; then
+        local oneshot_rc=0
+        setup_kernel_oneshot_boot "$INSTALLED_KERNEL_VERSION" || oneshot_rc=$?
+        if [[ $oneshot_rc -ne 0 ]]; then
+            print_error "一次性引导安全模式未能配置 —— 新内核可能成为默认且未经验证。"
+            if [[ $NON_INTERACTIVE -eq 1 ]]; then
+                print_warn "在远程无控制台服务器上这极不安全，正在自动回滚新内核安装。"
+                rollback_kernel_installation "$kernel_type"
+                return 1
+            else
+                if confirm "安全模式配置失败，是否回滚新内核安装？（远程服务器强烈建议）" "y"; then
+                    rollback_kernel_installation "$kernel_type"
+                    return 1
+                else
+                    print_warn "${ICON_WARN} 未回滚 —— 请务必在重启后手动确认引导正常，"
+                    print_warn "若新内核无法启动，请在 GRUB 菜单中手动选择旧内核。"
+                fi
+            fi
+        fi
+    fi
     return 0
 }
 
@@ -7356,7 +7828,7 @@ print_kernel_post_install_summary() {
     [[ -n "${INSTALLED_KERNEL_VERSION}" ]] && print_kv "新内核版本" "${INSTALLED_KERNEL_VERSION}"
     print_kv "下一步" "重启系统后生效"
     print_kv "验证命令" "$verify_hint"
-    print_kv "回滚提示" "如启动异常，请在 GRUB 中选择旧内核"
+    print_kv "回滚提示" "新内核以一次性引导启动，失败可断电重启自动回滚到旧内核"
     print_separator
 
     APPLY_GUIDANCE_SHOWN=1
@@ -7372,9 +7844,8 @@ detect_cpu_level() {
     local cpuinfo
     cpuinfo=$(cat /proc/cpuinfo 2>/dev/null)
     
-    if echo "$cpuinfo" | grep -q "avx512"; then
-        level="4"
-    elif echo "$cpuinfo" | grep -q "avx2"; then
+    # XanMod 仅提供 x64v1/v2/v3，AVX2 已是最高级别 v3
+    if echo "$cpuinfo" | grep -q "avx2"; then
         level="3"
     elif echo "$cpuinfo" | grep -q "sse4_2"; then
         level="2"
@@ -7394,15 +7865,21 @@ download_xanmod_direct() {
     print_step "直接下载 XanMod 内核包..."
     print_info "CPU 微架构级别: x64v${cpu_level}"
     
-    # 从 APT 源的 Packages 文件获取包信息
-    local pkg_list_url="http://deb.xanmod.org/dists/releases/main/binary-amd64/Packages.gz"
+    # 从 APT 源的 Packages 文件获取包信息（使用发行版代号；releases 套件已失效）
+    local xanmod_codename="${DIST_CODENAME:-$(lsb_release -sc 2>/dev/null || true)}"
+    if [[ -z "$xanmod_codename" ]]; then
+        print_warn "无法解析发行版代号"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    local pkg_list_url="http://deb.xanmod.org/dists/${xanmod_codename}/main/binary-amd64/Packages.gz"
     local pkg_list
-    
+
     print_info "获取包列表..."
     pkg_list=$(curl -fsSL --connect-timeout 15 "$pkg_list_url" 2>/dev/null | gunzip 2>/dev/null)
-    
+
     if [[ -z "$pkg_list" ]]; then
-        pkg_list_url="http://deb.xanmod.org/dists/releases/main/binary-amd64/Packages"
+        pkg_list_url="http://deb.xanmod.org/dists/${xanmod_codename}/main/binary-amd64/Packages"
         pkg_list=$(curl -fsSL --connect-timeout 15 "$pkg_list_url" 2>/dev/null)
     fi
     
@@ -7416,25 +7893,18 @@ download_xanmod_direct() {
     local pkg_filename=""
     local pkg_name=""
     
+    # 每个级别优先尝试非 LTS 稳定版，再尝试 LTS 版；所有包名均带 -x64v 后缀
     for try_level in $cpu_level 3 2 1; do
-        pkg_name="linux-xanmod-x64v${try_level}"
-        pkg_filename=$(echo "$pkg_list" | awk -v pkg="$pkg_name" '
-            /^Package:/ { current_pkg = $2 }
-            /^Filename:/ && current_pkg == pkg { print $2; exit }
-        ')
-        [[ -n "$pkg_filename" ]] && break
-    done
-    
-    if [[ -z "$pkg_filename" ]]; then
-        for pkg_name in "linux-xanmod-edge" "linux-xanmod-lts" "linux-xanmod"; do
+        for pkg_name in "linux-xanmod-x64v${try_level}" "linux-xanmod-lts-x64v${try_level}"; do
             pkg_filename=$(echo "$pkg_list" | awk -v pkg="$pkg_name" '
                 /^Package:/ { current_pkg = $2 }
                 /^Filename:/ && current_pkg == pkg { print $2; exit }
             ')
             [[ -n "$pkg_filename" ]] && break
         done
-    fi
-    
+        [[ -n "$pkg_filename" ]] && break
+    done
+
     if [[ -z "$pkg_filename" ]]; then
         print_warn "未找到合适的内核包"
         rm -rf "$tmp_dir"
@@ -7489,7 +7959,7 @@ download_xanmod_direct() {
 
 # 测试 XanMod APT 源速度
 test_xanmod_apt_speed() {
-    local test_url="http://deb.xanmod.org/gpg.key"
+    local test_url="https://dl.xanmod.org/archive.key"
     local start_time end_time elapsed
     
     start_time=$(date +%s%N)
@@ -7545,8 +8015,9 @@ select_xanmod_download_method() {
                     ;;
             esac
         else
-            # 非交互模式，使用直接下载
-            XANMOD_INSTALL_METHOD="direct"
+            # 非交互模式默认使用 APT：APT 会解析匹配的 linux-headers-* 包并触发
+            # 内核 postinst 钩子（initramfs + GRUB 更新），单个直下 .deb 不会拉取 headers，更脆弱
+            XANMOD_INSTALL_METHOD="apt"
         fi
     else
         XANMOD_INSTALL_METHOD="apt"
@@ -7567,7 +8038,16 @@ _install_kernel_xanmod_core() {
                 print_warn "软件包缓存更新失败，尝试继续安装依赖"
             fi
             apt-get install -y -qq curl gnupg
-            
+
+            # 检测 CPU 支持的指令集级别（需在 APT 包校验前可用）
+            # XanMod 仅提供 x64v1/v2/v3，无 x64v4，AVX2 即推荐 x64v3
+            local cpu_level="1"
+            if grep -q "avx2" /proc/cpuinfo 2>/dev/null; then
+                cpu_level="3"
+            elif grep -q "avx" /proc/cpuinfo 2>/dev/null; then
+                cpu_level="2"
+            fi
+
             # 如果选择直接下载方式
             if [[ "$XANMOD_INSTALL_METHOD" == "direct" ]]; then
                 print_info "使用直接下载方式安装..."
@@ -7584,30 +8064,41 @@ _install_kernel_xanmod_core() {
             
             # 添加 GPG 密钥（使用多个源尝试，包括 GitHub 镜像）
             local gpg_urls=(
-                "https://dl.xanmod.org/gpg.key"
-                "https://raw.githubusercontent.com/xanmod/linux/main/gpg.key"
+                "https://dl.xanmod.org/archive.key"
+                "https://raw.githubusercontent.com/xanmod/linux/main/archive.key"
             )
-            
 
-            
+            # 先下载到临时文件并验证非空，再 dearmor，避免空下载产生损坏的 keyring
             local gpg_downloaded=0
+            local gpg_tmp="/tmp/xanmod-archive-key-$$"
             for gpg_url in "${gpg_urls[@]}"; do
                 print_info "尝试从 ${gpg_url} 获取 GPG 密钥..."
-                if curl -fsSL --connect-timeout 10 "$gpg_url" | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg 2>/dev/null; then
-                    gpg_downloaded=1
-                    print_success "GPG 密钥获取成功"
-                    break
+                if curl -fsSL --connect-timeout 10 "$gpg_url" -o "$gpg_tmp" 2>/dev/null && [[ -s "$gpg_tmp" ]]; then
+                    # gpg --dearmor 拒绝覆盖已存在的输出文件，先删除旧 keyring
+                    rm -f /usr/share/keyrings/xanmod-archive-keyring.gpg
+                    if gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg < "$gpg_tmp" 2>/dev/null; then
+                        gpg_downloaded=1
+                        print_success "GPG 密钥获取成功"
+                        rm -f "$gpg_tmp"
+                        break
+                    fi
                 fi
+                rm -f "$gpg_tmp"
             done
-            
+
             if [[ $gpg_downloaded -eq 0 ]]; then
                 print_error "无法获取 XanMod GPG 密钥"
                 return 1
             fi
-            
-            # 添加源
+
+            # 添加源（使用发行版代号，而非旧的 releases 套件）
             local repo_url="http://deb.xanmod.org"
-            echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] ${repo_url} releases main" > /etc/apt/sources.list.d/xanmod.list
+            local xanmod_codename="${DIST_CODENAME:-$(lsb_release -sc 2>/dev/null || true)}"
+            if [[ -z "$xanmod_codename" ]]; then
+                print_error "无法解析发行版代号，无法配置 XanMod APT 源"
+                return 1
+            fi
+            echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] ${repo_url} ${xanmod_codename} main" > /etc/apt/sources.list.d/xanmod.list
             
             # 更新源（带重试和验证）
             print_step "更新 APT 源..."
@@ -7618,11 +8109,10 @@ _install_kernel_xanmod_core() {
             while [[ $retry_count -lt $max_retries ]]; do
                 # 执行 apt-get update 并正确检测返回值
                 if apt-get update -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/xanmod.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" 2>&1; then
-                    # 验证 XanMod 包是否可用
-                    if apt-cache show linux-xanmod-x64v3 >/dev/null 2>&1 || \
-                       apt-cache show linux-xanmod-x64v2 >/dev/null 2>&1 || \
-                       apt-cache show linux-xanmod >/dev/null 2>&1 || \
-                       apt-cache show linux-xanmod-edge >/dev/null 2>&1; then
+                    # 验证 XanMod 包是否可用（仅检查带 -x64v 后缀的真实包名）
+                    if apt-cache show "linux-xanmod-x64v${cpu_level}" >/dev/null 2>&1 || \
+                       apt-cache show "linux-xanmod-lts-x64v${cpu_level}" >/dev/null 2>&1 || \
+                       apt-cache show linux-xanmod-lts-x64v1 >/dev/null 2>&1; then
                         update_success=1
                         print_success "XanMod 源更新成功，包已可用"
                         break
@@ -7643,9 +8133,10 @@ _install_kernel_xanmod_core() {
                 print_warn "尝试最后一次完整 APT 更新..."
                 apt-get update 2>&1 || true
                 sleep 2
-                # 再次验证
-                if apt-cache show linux-xanmod-x64v3 >/dev/null 2>&1 || \
-                   apt-cache show linux-xanmod >/dev/null 2>&1; then
+                # 再次验证（仅检查带 -x64v 后缀的真实包名）
+                if apt-cache show "linux-xanmod-x64v${cpu_level}" >/dev/null 2>&1 || \
+                   apt-cache show "linux-xanmod-lts-x64v${cpu_level}" >/dev/null 2>&1 || \
+                   apt-cache show linux-xanmod-lts-x64v1 >/dev/null 2>&1; then
                     update_success=1
                     print_success "XanMod 包已可用"
                 else
@@ -7655,37 +8146,16 @@ _install_kernel_xanmod_core() {
                 fi
             fi
             
-            # 检测 CPU 支持的指令集级别
-            local cpu_level="1"
-            if grep -q "avx512" /proc/cpuinfo 2>/dev/null; then
-                cpu_level="4"
-            elif grep -q "avx2" /proc/cpuinfo 2>/dev/null; then
-                cpu_level="3"
-            elif grep -q "avx" /proc/cpuinfo 2>/dev/null; then
-                cpu_level="2"
-            fi
-            
             print_info "检测到 CPU 支持级别: x64v${cpu_level}"
-            
+
             # 根据 CPU 级别选择合适的内核包
+            # XanMod APT 源的包名始终带 -x64v{N} 后缀，没有裸包名
+            # 每个级别优先尝试非 LTS 稳定版，再尝试 LTS 版
             local candidates=()
-            case "$cpu_level" in
-                4)
-                    candidates=("linux-xanmod-x64v4" "linux-xanmod-x64v3" "linux-xanmod-x64v2" "linux-xanmod")
-                    ;;
-                3)
-                    candidates=("linux-xanmod-x64v3" "linux-xanmod-x64v2" "linux-xanmod")
-                    ;;
-                2)
-                    candidates=("linux-xanmod-x64v2" "linux-xanmod")
-                    ;;
-                *)
-                    candidates=("linux-xanmod")
-                    ;;
-            esac
-            
-            # 添加 edge 和 lts 变体
-            candidates+=("linux-xanmod-edge" "linux-xanmod-lts")
+            local L
+            for L in $(seq "$cpu_level" -1 1); do
+                candidates+=("linux-xanmod-x64v${L}" "linux-xanmod-lts-x64v${L}")
+            done
             
             # ========== 安装前环境检查 ==========
             print_step "检查系统环境..."
@@ -7796,7 +8266,7 @@ _install_kernel_liquorix_core() {
             fi
             
             print_step "安装 Liquorix 内核..."
-            apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64
+            apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64 || return 1
             ;;
         debian)
             print_step "安装 Liquorix 内核..."
@@ -7830,28 +8300,34 @@ _install_kernel_elrepo_core() {
     case "$DIST_ID" in
         centos|rhel|rocky|almalinux)
             local rhel_ver="${DIST_VER%%.*}"
-            
+
+            # el7 已 EOL，ELRepo 不再为 el7 提供 kernel-ml
+            if [[ "$rhel_ver" == "7" ]]; then
+                print_error "EL7 已停止维护，ELRepo 不再为 el7 提供 kernel-ml，无法安装"
+                return 1
+            fi
+
             print_step "更新软件包缓存..."
             if command -v dnf >/dev/null 2>&1; then
                 dnf makecache -q || true
             else
                 yum makecache -q || true
             fi
-            
+
             print_step "启用 ELRepo..."
-            
+
             local elrepo_url="https://www.elrepo.org/elrepo-release-${rhel_ver}.el${rhel_ver}.elrepo.noarch.rpm"
-            
+
             if command -v dnf >/dev/null 2>&1; then
-                dnf install -y "$elrepo_url" || true
-                
+                rpm -Uvh "$elrepo_url" 2>/dev/null || dnf install -y "$elrepo_url" || return 1
+
                 print_step "安装 kernel-ml..."
-                dnf --enablerepo=elrepo-kernel install -y kernel-ml
+                dnf --enablerepo=elrepo-kernel install -y kernel-ml || return 1
             else
-                yum install -y "$elrepo_url" || true
-                
+                rpm -Uvh "$elrepo_url" 2>/dev/null || yum install -y "$elrepo_url" || return 1
+
                 print_step "安装 kernel-ml..."
-                yum --enablerepo=elrepo-kernel install -y kernel-ml
+                yum --enablerepo=elrepo-kernel install -y kernel-ml || return 1
             fi
             ;;
         *)
@@ -7888,13 +8364,19 @@ _install_kernel_hwe_core() {
     
     case "$DIST_VER" in
         16.04*)
-            apt-get install -y linux-generic-hwe-16.04
+            apt-get install -y linux-generic-hwe-16.04 || return 1
             ;;
         18.04*)
-            apt-get install -y linux-generic-hwe-18.04
+            apt-get install -y linux-generic-hwe-18.04 || return 1
             ;;
         20.04*)
-            apt-get install -y linux-generic-hwe-20.04
+            apt-get install -y linux-generic-hwe-20.04 || return 1
+            ;;
+        22.04*)
+            apt-get install -y linux-generic-hwe-22.04 || return 1
+            ;;
+        24.04*)
+            apt-get install -y linux-generic-hwe-24.04 || return 1
             ;;
         *)
             print_error "当前 Ubuntu 版本不支持 HWE 内核"
@@ -7927,6 +8409,9 @@ install_kernel_hwe() {
 # 重启提示
 prompt_reboot() {
     echo
+    if [[ -f "$KERNEL_PENDING_FILE" ]]; then
+        print_info "提示：新内核将以「一次性引导」方式启动，失败可断电重启自动回滚。"
+    fi
     if confirm "是否现在重启系统？" "n"; then
         print_info "系统将在 5 秒后重启..."
         sleep 5
@@ -7981,20 +8466,24 @@ show_status() {
         bbr3_available="${RED}否${NC}"
     fi
     
-    if [[ "$current_algo" == "bbr3" ]] || { [[ "$current_algo" == "bbr" ]] && version_ge "$kver" "6.9.0"; }; then
+    if [[ "$current_algo" == "bbr3" ]] || { [[ "$current_algo" == "bbr" ]] && kernel_has_bbr3; }; then
         bbr3_active="${GREEN}是${NC}"
     else
         bbr3_active="${RED}否${NC}"
     fi
-    
+
     echo -e "  BBR3 可用    : ${bbr3_available}"
     echo -e "  BBR3 已启用  : ${bbr3_active}"
     print_kv "内核版本" "$kver"
-    
-    if version_ge "$kver" "6.9.0"; then
-        echo -e "  主线 BBRv3   : ${GREEN}是${NC} (>= 6.9.0)"
+
+    if kernel_has_bbr3; then
+        if grep -qw "bbr3" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            echo -e "  BBRv3 状态   : ${GREEN}已支持${NC} (内核显式提供 bbr3)"
+        else
+            echo -e "  BBRv3 状态   : ${GREEN}已支持${NC} (XanMod 内核)"
+        fi
     else
-        echo -e "  主线 BBRv3   : ${YELLOW}否${NC} (需要 >= 6.9.0)"
+        echo -e "  BBRv3 状态   : ${YELLOW}未支持${NC} (主线内核仅 BBR v1，可安装 XanMod)"
     fi
     echo
     
@@ -8106,7 +8595,7 @@ show_kernel_menu() {
         debian|ubuntu)
             menu_items+=("XanMod (推荐，支持 BBR3)")
             menu_items+=("Liquorix (桌面优化)")
-            if [[ "$DIST_ID" == "ubuntu" ]] && [[ "$DIST_VER" =~ ^(16|18|20)\. ]]; then
+            if [[ "$DIST_ID" == "ubuntu" ]] && [[ "$DIST_VER" =~ ^(16|18|20|22|24)\. ]]; then
                 menu_items+=("HWE 内核 (官方硬件支持)")
             fi
             ;;
@@ -8320,7 +8809,7 @@ EOF
 #!/bin/bash
 # BBR3 时间自动切换脚本
 HOUR=$(date +%H)
-if [[ $HOUR -ge 19 || $HOUR -lt 2 ]]; then
+if [[ 10#$HOUR -ge 19 || 10#$HOUR -lt 2 ]]; then
     # 晚高峰模式 (19:00-02:00)
     sysctl -p /etc/sysctl.d/99-bbr-peak.conf >/dev/null 2>&1
     logger "BBR3: 切换到晚高峰模式"
@@ -8357,10 +8846,22 @@ SCRIPT
 # 更新脚本
 update_script() {
     print_header "更新脚本"
-    
-    local current_script="$0"
+
+    # 解析真实脚本路径；通过 curl|bash 运行时无真实文件路径，拒绝自更新
+    if [[ "$0" == "bash" || "$0" == "-bash" || "$0" == /dev/fd/* || "$0" == /proc/self/fd/* ]]; then
+        print_error "脚本似乎通过管道运行（如 curl | bash），无法自更新"
+        print_info "请先将脚本下载到本地文件后再执行更新"
+        return 1
+    fi
+    local current_script
+    current_script=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    if [[ -z "$current_script" ]] || [[ ! -f "$current_script" ]]; then
+        print_error "无法定位脚本文件路径，无法自更新"
+        print_info "请手动下载最新版本"
+        return 1
+    fi
     local tmp_script="/tmp/easybbr3_new.sh"
-    
+
     echo -e "${DIM}从 GitHub 下载最新版本...${NC}"
     echo
     
@@ -8405,6 +8906,13 @@ update_script() {
         print_info "已备份当前脚本到 ${current_script}.bak"
     fi
     
+    # 替换前对下载的文件做语法检查
+    if ! bash -n "$tmp_script" 2>/dev/null; then
+        print_error "下载的新版本未通过语法检查，已中止更新"
+        rm -f "$tmp_script"
+        return 1
+    fi
+
     # 替换脚本
     chmod +x "$tmp_script"
     mv "$tmp_script" "$current_script"
@@ -8608,6 +9116,7 @@ main() {
                 shift
                 ;;
             --mirror)
+                [[ -z "${2:-}" ]] && { print_error "--mirror 需要参数"; exit 1; }
                 local mirror_name="${2:-auto}"
                 case "$mirror_name" in
                     tsinghua|aliyun|ustc|huawei)
@@ -8751,14 +9260,17 @@ main() {
     detect_arch
     detect_virt
     try_load_modules
-    
+
+    # 内核一次性引导待确认检查（静默；无标记时无输出）
+    kernel_finalize_check
+
     # 快速检测 BBR3
     if [[ $check_bbr3 -eq 1 ]]; then
         local kver algo
         kver=$(uname -r | sed 's/[^0-9.].*$//')
         algo=$(get_current_algo)
         
-        if [[ "$algo" == "bbr3" ]] || { [[ "$algo" == "bbr" ]] && version_ge "$kver" "6.9.0"; }; then
+        if [[ "$algo" == "bbr3" ]] || { [[ "$algo" == "bbr" ]] && kernel_has_bbr3; }; then
             echo "BBR3_ACTIVE=YES"
             echo "KERNEL=${kver}"
             echo "ALGO=${algo}"
