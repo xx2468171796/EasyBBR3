@@ -1,0 +1,18 @@
+{
+  "id": "easybbr3",
+  "name": "EasyBBR3 网络调优脚本",
+  "category": "tool",
+  "hub": {
+    "ankottipublic": "http://192.168.110.246:3001/admin/ankottipublic.git",
+    "ecosystemHub": "http://192.168.110.246:8771"
+  },
+  "mcp": "ecosystem",
+  "stack": "unknown",
+  "dependsOn": [],
+  "provides": [
+    "一键安装 BBR/BBR2/BBR3 拥塞控制",
+    "Linux VPS 全面网络调优脚本"
+  ],
+  "status": "active",
+  "adopted": true
+}
